@@ -29,8 +29,14 @@
  *     'T' seek    i64 90 kHz time in the current playlist
  *     'V' angle   u8 angle (1-based; 0 the next one)
  *     'G' graphics poll: hands over BD-J plane changes (also sent before every reply)
- *   BD-J needs JAVA_HOME and LIBBLURAY_CP; BDNAVD_STORAGE holds its persistent
- *   and cache data.
+ *   BD-J runs only inside the sandbox (sandbox.h): JAVA_HOME is the Java runtime,
+ *   BDNAVD_JAVA_OPTIONS the server's JVM options (heap and other caps),
+ *   BDNAVD_PERSISTENT the persistent storage (none: persistent storage off);
+ *   cache and Java's temp go in $TMPDIR (the worker's own work directory).
+ *   Exit status 3 is the JVM's out-of-memory exit (-XX:+ExitOnOutOfMemoryError);
+ *   bdnavd's own failures exit 2 or 4.
+ *   A numbered BD-J title whose BDJO lists no playlists (a game: no video) is
+ *   declined: a "title_declined" event, then the top menu again.
  *   Discs with BD-J titles and no usable Java VM open in direct mode: the main
  *   title plays without the disc's menus (keys other than chapters, audio and
  *   subtitles are refused).
@@ -71,6 +77,7 @@
 #include <libbluray/log_control.h>
 #include "bdcaps.h"
 #include "readsvc.h"
+#include "sandbox.h"
 
 #define UNIT 6144
 #define MAX_UNITS 64           /* per 'N' command and per 'D' frame */
@@ -138,24 +145,48 @@ static void frame_head(char type, uint32_t len) {
   head[2] = (total >> 16) & 0xff;
   head[3] = (total >> 24) & 0xff;
   head[4] = (uint8_t)type;
-  if (write_all(head, 5) < 0) _exit(3);
+  if (write_all(head, 5) < 0) _exit(4);
 }
 
 static void frame_done(void) { pthread_mutex_unlock(&out_lock); }
 
 static void frame(char type, const void *payload, uint32_t len) {
   frame_head(type, len);
-  if (len > 0 && write_all(payload, len) < 0) _exit(3);
+  if (len > 0 && write_all(payload, len) < 0) _exit(4);
   frame_done();
 }
 
 #ifndef SEEVUE_WORKER_VERSION
 #define SEEVUE_WORKER_VERSION "dev"
 #endif
-/* The hello, once, before any command is read. */
+/* What sandbox_apply() reported, for the hello; BD-J starts only when it
+   applied one. */
+static const char *sandbox_state = "none";
+static char sandbox_error[160];
+static int sandboxed(void) { return strcmp(sandbox_state, "none") && strcmp(sandbox_state, "unavailable"); }
+
+/* Only ci/control.sh builds this opt-in, deliberately uncontained test binary. */
+static int java_allowed(void) {
+#ifdef BDNAVD_TEST_CONTROL
+  if (getenv("BDNAVD_TEST_CONTROL")) return 1;
+#endif
+  return sandboxed();
+}
+
+/* The hello, once, before any command is read: the protocol, this build and
+   its sandbox ("sandbox_error" says why one that was asked for is missing). */
 static void send_hello(void) {
-  static const char hello[] = "{\"protocol\":3,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
-  frame('H', hello, (uint32_t)(sizeof hello - 1));
+  char hello[512], esc[sizeof sandbox_error];
+  size_t k = 0;
+  for (const char *c = sandbox_error; *c && k + 1 < sizeof esc; c++)
+    if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) esc[k++] = *c;
+  esc[k] = 0;
+  int n = snprintf(hello, sizeof hello,
+                   "{\"protocol\":4,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION
+                   "\",\"sandbox\":\"%s\"%s%s%s}",
+                   sandbox_state, *esc ? ",\"sandbox_error\":\"" : "", esc, *esc ? "\"" : "");
+  if (n < 0 || (size_t)n >= sizeof hello) n = 0;
+  frame('H', hello, (uint32_t)n);
 }
 
 static int read_all(void *p, size_t n) {
@@ -287,9 +318,9 @@ static void send_plane(int p, int64_t pts) {
   put16(head + 14, (uint16_t)w);
   put16(head + 16, (uint16_t)h);
   frame_head('G', 18 + (uint32_t)w * (uint32_t)h * 4);
-  if (write_all(head, 18) < 0) _exit(3);
+  if (write_all(head, 18) < 0) _exit(4);
   for (int y = 0; y < h; y++)
-    if (write_all(plane[p] + (size_t)(b[1] + y) * PLANE_W + b[0], (size_t)w * 4) < 0) _exit(3);
+    if (write_all(plane[p] + (size_t)(b[1] + y) * PLANE_W + b[0], (size_t)w * 4) < 0) _exit(4);
   frame_done();
   memset(bbox[p], 0, sizeof bbox[p]);
   cleared[p] = 0;
@@ -354,31 +385,28 @@ static int argb_flushed;          /* BD-J has drawn since its title started */
 static atomic_int argb_woken;      /* a wake notice is out for changes not yet sent */
 
 /* A BD-J title that has drawn nothing BDJ_RETRY_MS after starting gets a menu
-   call (as the remote's top-menu key would), at most BDJ_RETRIES times per
-   start. Ratatouille's application failed to start intermittently in
+   call (as the remote's top-menu key would), within the disc's one restart
+   (BDJ_RESTARTS). Ratatouille's application failed to start intermittently in
    libbluray's BD-J ("failed: Addendum.png", an image load on an intact cached
    file; more often while the stream is being read); a menu call restarted it
    every time in testing (results/c9). */
-#define BDJ_RETRY_MS 5000
-#define BDJ_RETRIES 2
+#include "bdj_retry.h"
+static int bdj_restarts;
 static uint64_t bdj_started_at;
-static int bdj_retries;
 static uint64_t bdj_bytes;        /* stream read since the BD-J title started */
 
 /* The failure itself is only in libbluray's log ("doStart() failed"): a title
    whose main application failed can still draw (Ratatouille's loading
    flourish), so "drew nothing" misses it. The worker reads its own stderr
    (libbluray's and the JVM's log), passes it on, and restarts the title with
-   a menu call when an application fails to start, at most BDJ_FAIL_RETRIES
-   times per disc. */
-#define BDJ_FAIL_RETRIES 3
+   a menu call when an application fails to start, within BDJ_RESTARTS; a
+   failure after that is reported as final ("start"). */
 static atomic_int bdj_start_failed;
 /* An application that cannot even load ("doLoad() failed": its JAR is missing or
    unreadable) will not load on a restart: report it once instead. */
 static atomic_int bdj_load_failed;
 static char bdj_fail_line[256];   /* the log line, JSON-safe (written before the flag) */
 static int bdj_reported;
-static int bdj_fail_retries;
 static int real_stderr = STDERR_FILENO;
 
 static void *log_relay(void *arg) {
@@ -581,7 +609,7 @@ static void argb_send_pending(void) {
     put16(head + 14, (uint16_t)w);
     put16(head + 16, (uint16_t)h);
     frame_head('G', 18 + (uint32_t)w * (uint32_t)h * 4);
-    if (write_all(head, 18) < 0 || write_all(argb_stage, (size_t)w * h * 4) < 0) _exit(3);
+    if (write_all(head, 18) < 0 || write_all(argb_stage, (size_t)w * h * 4) < 0) _exit(4);
     frame_done();
   }
 }
@@ -623,14 +651,52 @@ static void j_streams(uint32_t item) {
   bd_free_title_info(ti);
 }
 
+static uint32_t be32(const uint8_t *b) { return (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3]; }
+
+/* A BD-J object with no playlists to play (none listed, and not "all"): a
+   game or another application without video. The BDJO is read through the
+   disc's file system (the read service). Unreadable: not a game; libbluray
+   reports what it cannot use. */
+static int bdjo_is_game(uint32_t object) {
+  char path[32];
+  snprintf(path, sizeof path, "BDMV/BDJO/%05u.bdjo", object % 100000);
+  void *data = NULL;
+  int64_t size = 0;
+  if (!bd_read_file(bd, path, &data, &size) || !data) return 0;
+  const uint8_t *b = data;
+  int game = 0;
+  /* Header and address table (48 bytes), then length-prefixed blocks:
+     terminal info, application cache info, accessible playlists. */
+  uint64_t off = 48;
+  for (int block = 0; block < 2 && off + 4 <= (uint64_t)size; block++) off += 4 + (uint64_t)be32(b + off);
+  if (off + 8 <= (uint64_t)size) {
+    uint32_t word = be32(b + off + 4);
+    uint32_t playlists = word >> 21, all = (word >> 20) & 1;
+    game = playlists == 0 && !all;
+  }
+  free(data);
+  return game;
+}
+
+static void decline_title(uint32_t title) {
+  fprintf(stderr, "bdnavd: title %u is a BD-J application without video (a game); back to the menu\n", title);
+  j_begin();
+  j("\"ev\":\"title_declined\",\"title\":%u,\"reason\":\"game\"", title);
+  j_end('E');
+}
+
 /* Emits one event; returns its stop reason, or NULL to keep reading. */
 static const char *event(const BD_EVENT *ev) {
+  int declined = 0;
   if (ev->event == BD_EVENT_NONE) return NULL;
   switch (ev->event) {
     case BD_EVENT_PLAYLIST: cur_playlist = ev->param; break;
     case BD_EVENT_TITLE: {
       const BLURAY_DISC_INFO *di = bd_get_disc_info(bd);
       if (di && ev->param >= 1 && ev->param <= di->num_titles && di->titles[ev->param] &&
+          di->titles[ev->param]->bdj && bdjo_is_game(di->titles[ev->param]->id_ref)) {
+        declined = 1;
+      } else if (di && ev->param >= 1 && ev->param <= di->num_titles && di->titles[ev->param] &&
           di->titles[ev->param]->bdj) {
         pthread_mutex_lock(&argb_state);
         argb_flushed = 0;
@@ -654,6 +720,11 @@ static const char *event(const BD_EVENT *ev) {
   j_position();
   if (ev->event == BD_EVENT_PLAYITEM) j_streams(ev->param);
   j_end('E');
+  if (declined) {
+    decline_title(ev->param);
+    /* Back to the top menu, as its key would; a disc that forbids that stops. */
+    if (!bd_menu_call(bd, -1)) return "game";
+  }
   switch (ev->event) {
     /* libbluray could not run the title: a Java title is a BD-J failure. */
     case BD_EVENT_ERROR: return ev->param == BD_ERROR_BDJ ? "bdj_error" : "error";
@@ -692,28 +763,18 @@ static void bdj_watch(void) {
     return;
   }
   int start_failed = atomic_exchange(&bdj_start_failed, 0);
-  if (start_failed && bdj_fail_retries >= BDJ_FAIL_RETRIES) { bdj_report("start", "start"); return; }
-  if (start_failed && bdj_fail_retries < BDJ_FAIL_RETRIES) {
-    bdj_fail_retries++;
-    fprintf(stderr, "bdnavd: BD-J application failed to start; menu call to restart it (%d/%d)\n",
-            bdj_fail_retries, BDJ_FAIL_RETRIES);
-    bdj_report("restart", "start");
-    bd_menu_call(bd, -1);
-    return;
-  }
-  if (!bdj_started_at) return;
   pthread_mutex_lock(&argb_state);
   int drawn = argb_flushed;
   pthread_mutex_unlock(&argb_state);
-  /* Drawing or playing video: the application is running (some play intros first). */
-  if (drawn || bdj_bytes > 0) { bdj_started_at = 0; bdj_retries = 0; return; }
-  if (mono_ms() - bdj_started_at < BDJ_RETRY_MS) return;
-  if (bdj_retries >= BDJ_RETRIES) { bdj_started_at = 0; return; }
-  bdj_retries++;
-  fprintf(stderr, "bdnavd: BD-J title drew nothing in %d ms; menu call to restart it (%d/%d)\n",
-          BDJ_RETRY_MS, bdj_retries, BDJ_RETRIES);
+  enum bdj_retry_action action = bdj_retry_step(&bdj_restarts, &bdj_started_at,
+                                               start_failed, drawn || bdj_bytes > 0, mono_ms());
+  if (action == BDJ_WAIT) return;
+  const char *reason = start_failed ? "start" : "no_draw";
+  if (action == BDJ_FAILED) { bdj_report("start", reason); return; }
+  fprintf(stderr, "bdnavd: BD-J start failed (%s); menu call to restart it (%d/%d)\n",
+          reason, bdj_restarts, BDJ_RESTARTS);
+  bdj_report("restart", reason);
   bd_menu_call(bd, -1);
-  bdj_started_at = mono_ms();
 }
 
 static void drain_events(void) {
@@ -826,32 +887,55 @@ static BD_DIR_H *folder_dir(void *handle, const char *rel_path) {
 static void cmd_open(const uint8_t *p, uint32_t len) {
   if (bd) { reply_error("already_open"); return; }
   if (len < 14) { reply_error("bad_open"); return; }
-  /* The JVM mounts the disc's JARs under java.io.tmpdir in a directory named
-     after the disc, shared by every process: an ending session's clean-up
-     removed a starting session's mount (BD-J start-up "io exception").
-     Give each worker its own. */
+  /* BD-J's cache and Java's temp directory are this worker's own, in its work
+     directory ($TMPDIR, removed by the server when the session ends). The JVM
+     mounts the disc's JARs under java.io.tmpdir in a directory named after the
+     disc: shared, an ending session's clean-up removed a starting session's
+     mount (BD-J start-up "io exception"). libbluray clears its cache when a
+     session starts and deletes from it as one ends: shared, an ending session
+     deleted files a starting one had just cached. */
+  const char *work = getenv("TMPDIR");
+  if (work && *work && !strchr(work, '"')) {
+    snprintf(own_tmp, sizeof own_tmp, "%s/bdj-tmp", work);
+    snprintf(own_cache, sizeof own_cache, "%s/bdj-cache", work);
+    if (mkdir(own_tmp, 0700) != 0 && errno != EEXIST) own_tmp[0] = 0;
+    if (mkdir(own_cache, 0700) != 0 && errno != EEXIST) own_cache[0] = 0;
+    /* fontconfig's cache (BD-J's fonts). */
+    char xdg[1100];
+    snprintf(xdg, sizeof xdg, "%s/xdg", work);
+    setenv("XDG_CACHE_HOME", xdg, 0);
+  }
   /* Java 18+ ignores a security manager unless the JVM allows one. libbluray
      installs its own anyway (a reflection workaround), but the JDK then skips
      its file checks, and those checks are what copy disc files into
      libbluray's cache on demand when the disc has no mount point (an image,
      or the read service's blocks or files, as here): BD-J menus that read the
      disc's playlists or images themselves got "file not found" and drew
-     nothing. */
-  char opt[1200] = "-Djava.security.manager=allow";
-  const char *store = getenv("BDNAVD_STORAGE");
-  if (store && *store) {
-    char d[1024];
-    snprintf(d, sizeof d, "%s/tmp", store);
-    mkdir(d, 0700);
-    snprintf(own_tmp, sizeof own_tmp, "%s/tmp/%d", store, (int)getpid());
-    if (mkdir(own_tmp, 0700) == 0 || errno == EEXIST)
-      snprintf(opt, sizeof opt, "-Djava.security.manager=allow -Djava.io.tmpdir=%s", own_tmp);
-  }
+     nothing. The server's options come first (the heap and other caps); a JVM
+     out of memory exits with status 3. Quoted, so paths may hold spaces. */
+  char opt[4096];
+  const char *server_opts = getenv("BDNAVD_JAVA_OPTIONS");
+  int used = snprintf(opt, sizeof opt, "%s%s-Djava.security.manager=allow -XX:+ExitOnOutOfMemoryError",
+                      server_opts ? server_opts : "", server_opts && *server_opts ? " " : "");
+  if (used > 0 && (size_t)used < sizeof opt && *own_tmp)
+    snprintf(opt + used, sizeof opt - (size_t)used, " \"-Djava.io.tmpdir=%s\"", own_tmp);
   setenv("JAVA_TOOL_OPTIONS", opt, 1);
   int layout = 0;
   if (rs_info(&layout, &image_size) != 0) { reply_error("no_disc"); return; }
   bd = bd_init();
   if (!bd) { reply_error("not_bluray"); return; }
+  /* Java only inside the sandbox. Set, libbluray's Java home overrides its
+     own search (JAVA_HOME, then the system's Java): outside one it names
+     nowhere, so a BD-J disc opens in direct mode. */
+  const char *java = getenv("JAVA_HOME");
+  bd_set_player_setting_str(bd, BLURAY_PLAYER_JAVA_HOME,
+                            java_allowed() && java && *java ? java : "/nonexistent/seevue-bdj-off");
+  const char *persistent = getenv("BDNAVD_PERSISTENT");
+  if (java_allowed() && persistent && *persistent)
+    bd_set_player_setting_str(bd, BLURAY_PLAYER_PERSISTENT_ROOT, persistent);
+  else
+    bd_set_player_setting(bd, BLURAY_PLAYER_SETTING_PERSISTENT_STORAGE, BLURAY_PERSISTENT_STORAGE_DISABLE);
+  if (*own_cache) bd_set_player_setting_str(bd, BLURAY_PLAYER_CACHE_ROOT, own_cache);
   int opened = layout == RS_FOLDER ? bd_open_files(bd, NULL, folder_dir, folder_file)
                                    : bd_open_stream(bd, NULL, image_blocks);
   if (!opened) { reply_error("not_bluray"); return; }
@@ -870,19 +954,6 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
   argb.lock = argb_lock_cb;
   argb.unlock = argb_unlock_cb;
   bd_register_argb_overlay_proc(bd, NULL, argb_overlay, &argb);
-  /* BD-J storage, per session (the server's directory); without it BD-J keeps
-     its defaults under the user's home. */
-  const char *storage = getenv("BDNAVD_STORAGE");
-  if (storage && *storage) {
-    char dir[1024];
-    snprintf(dir, sizeof dir, "%s/persistent", storage);
-    bd_set_player_setting_str(bd, BLURAY_PLAYER_PERSISTENT_ROOT, dir);
-    /* The cache is per worker: libbluray clears it when a session starts and
-       deletes from it as one ends, so a shared cache let an ending session
-       delete files a starting one had just cached (BD-J start-up I/O errors). */
-    snprintf(own_cache, sizeof own_cache, "%s/cache/%d", storage, (int)getpid());
-    bd_set_player_setting_str(bd, BLURAY_PLAYER_CACHE_ROOT, own_cache);
-  }
   /* Decode subtitles (PG); whether they show is the disc's (or the viewer's) choice. */
   bd_set_player_setting(bd, BLURAY_PLAYER_SETTING_DECODE_PG, 1);
   uint32_t titles = bd_get_titles(bd, TITLES_RELEVANT, 0);
@@ -1125,6 +1196,9 @@ int main(void) {
     fprintf(stderr, "bdnavd: cannot set up output\n");
     return 2;
   }
+  /* The caps and the sandbox, before any disc data is read. */
+  sandbox_state = sandbox_apply(sandbox_error, sizeof sandbox_error);
+  if (*sandbox_error) fprintf(stderr, "bdnavd: sandbox unavailable: %s\n", sandbox_error);
   /* stdout and stderr (ours, libbluray's, the JVM's) go through log_relay. */
   int logp[2];
   pthread_t relay;

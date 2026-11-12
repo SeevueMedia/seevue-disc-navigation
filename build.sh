@@ -210,7 +210,7 @@ fi
 # clock_gettime under -std=c11 without one (macOS shows them by default).
 BDNAVD_EXTRA=()
 [[ "$OS" == linux ]] && BDNAVD_EXTRA=(-D_GNU_SOURCE)
-cc "${WARN[@]}" ${BDNAVD_EXTRA[@]+"${BDNAVD_EXTRA[@]}"} -I"$PREFIX/include" "$ROOT/src/bdnavd.c" "$ROOT/src/readsvc.c" -L"$PREFIX/lib" -lbluray -lpthread \
+cc "${WARN[@]}" ${BDNAVD_EXTRA[@]+"${BDNAVD_EXTRA[@]}"} -I"$PREFIX/include" "$ROOT/src/bdnavd.c" "$ROOT/src/readsvc.c" "$ROOT/src/sandbox.c" -L"$PREFIX/lib" -lbluray -lpthread \
   "${RPATH[@]}" -o "$STAGE/bin/bdnavd"
 
 # Shared libraries under their sonames, found through the rpath.

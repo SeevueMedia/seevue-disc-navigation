@@ -8,13 +8,15 @@ dist="$1" platform="$2"
 version="$(tr -d '[:space:]' < "$(dirname "$0")/../VERSION")"
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
+${CC:-cc} -std=c11 -Wall -Wextra -Werror "$(dirname "$0")/bdj-retry-test.c" -o "$dir/bdj-retry-test"
+"$dir/bdj-retry-test"
 tar xf "$dist/seevue-disc-navigation-$version-$platform.tar.xz" -C "$dir"
 tar xf "$dist"/seevue-disc-jre-*-"$platform".tar.xz -C "$dir"
 (cd "$dist" && shasum -a 256 -c "SHA256SUMS-$platform" 2>/dev/null || sha256sum -c "SHA256SUMS-$platform")
 test "$(cat "$dir/VERSION")" = "$version"
-# Each worker's first frame is its protocol v3 hello.
+# Each worker's first frame is its protocol v4 hello (bdnavd adds its sandbox).
 for worker in navd bdnavd; do
-  "$dir/bin/$worker" </dev/null | grep -aq "{\"protocol\":3,\"worker\":\"$worker\",\"version\":\"$version\"}"
+  "$dir/bin/$worker" </dev/null | grep -aq "{\"protocol\":4,\"worker\":\"$worker\",\"version\":\"$version\""
 done
 "$dir/jre/bin/java" -Xshare:auto -version
 case "$platform" in
