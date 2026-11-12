@@ -1,0 +1,31 @@
+seevue-disc-navigation: third-party notices
+===========================================
+
+This archive holds two helper programs that Seevue's server runs as separate
+processes and talks to over a pipe. The server never links them.
+
+navd   DVD navigation. Statically linked with libdvdnav 7.0.0 and
+       libdvdread 7.1.1, both GPL-2.0-or-later, so navd is distributed
+       under the GNU General Public License, version 2 or later
+       (seevue-disc-navigation-GPL-2.0.txt). libdvdcss is not included.
+
+bdnavd Blu-ray navigation. Dynamically linked with libbluray 1.5.0 and
+       libudfread 1.2.0 (LGPL-2.1-or-later), shipped as shared libraries
+       in lib/ so they can be replaced. bdnavd itself is distributed under
+       the GPL, version 2 or later.
+
+libbluray carries two patches (licenses/patches/libbluray/): serialised
+libudfread calls and the IG animation frame interval. Its BD-J classes
+(lib/libbluray-*.jar) are LGPL-2.1-or-later.
+
+Built into the libbluray shared library:
+  FreeType 2.14.3     FreeType License (freetype-FTL.txt)
+  fontconfig 2.16.0   MIT-style licence (fontconfig-COPYING.txt)
+  expat 2.10.0        MIT licence (expat-COPYING.txt)
+
+The separate Java runtime archive (seevue-disc-jre-*) is a jlink image of
+Eclipse Temurin OpenJDK 21, GPL-2.0 with the Classpath Exception; its own
+notices are in jre/legal/.
+
+Each component's licence text is in this folder. This notice is not legal
+advice; a licence review is required before release.

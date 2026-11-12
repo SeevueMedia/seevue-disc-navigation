@@ -1,0 +1,27 @@
+--- a/src/libbluray/decoders/graphics_controller.c	2026-11-09 09:46:27
++++ b/src/libbluray/decoders/graphics_controller.c	2026-11-09 09:46:28
+@@ -428,15 +428,17 @@
+         gc->bog_data[ii].visible_object_id = -1;
+     }
+ 
+-    /* animation frame rate */
++    /* animation frame rate: one video frame in 90 kHz ticks (the original
++       table multiplied by the rate, 90000 / 1001 * 24 = 2136 instead of 3753, so
++       animations ran 1.76x too fast at 23.976 and 2.5x too slow at 50) */
+     static const unsigned frame_interval[8] = {
+         0,
+-        90000 / 1001 * 24,
+-        90000 / 1000 * 24,
+-        90000 / 1000 * 25,
+-        90000 / 1001 * 30,
+-        90000 / 1000 * 50,
+-        90000 / 1001 * 60,
++        90000 * 1001 / 24000,
++        90000 / 24,
++        90000 / 25,
++        90000 * 1001 / 30000,
++        90000 / 50,
++        90000 * 1001 / 60000,
+     };
+     gc->frame_interval = frame_interval[s->ics->video_descriptor.frame_rate] * (page->animation_frame_rate_code + 1);
+ 

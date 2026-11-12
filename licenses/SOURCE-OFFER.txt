@@ -1,0 +1,24 @@
+Source code
+===========
+
+The complete corresponding source code for navd and bdnavd, the build
+script, the pinned source list (sources.lock, with the SHA-256 of every
+upstream tarball) and the libbluray patches are published at
+
+  https://github.com/SeevueMedia/seevue-disc-navigation
+
+under the release tag that matches VERSION in this archive. The upstream
+sources are the tarballs named in sources.lock:
+
+  libdvdnav, libdvdread, libbluray, libudfread
+      https://download.videolan.org/pub/videolan/
+  FreeType     https://download.savannah.gnu.org/releases/freetype/
+  fontconfig   https://www.freedesktop.org/software/fontconfig/release/
+  expat        https://github.com/libexpat/libexpat/releases
+  OpenJDK 21 (Eclipse Temurin), for the separate Java runtime archive
+      https://github.com/adoptium/jdk21u
+
+DISTRIBUTION GATE: this file is not yet a written offer under GPLv2 section
+3(b). Whoever distributes these binaries ships the corresponding source with
+them, or replaces this file with a valid written offer and its fulfilment
+contact, after the licence review.

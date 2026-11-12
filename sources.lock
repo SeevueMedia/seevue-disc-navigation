@@ -1,0 +1,16 @@
+# Pinned sources for every archive. One line per file:
+#   name  version  platform  sha256  url  checked-against
+# platform is "any" or one of macos-aarch64, linux-x86_64, linux-aarch64.
+# build.sh downloads each file once, checks its SHA-256 and refuses to build
+# on any mismatch. checked-against says where the checksum came from.
+libdvdread  7.1.1  any  a0d47876548bec806774bbf8dbf20bb19ba139464383156b32eb8e59915b90a9  https://download.videolan.org/pub/videolan/libdvdread/7.1.1/libdvdread-7.1.1.tar.xz  videolan .sha256
+libdvdnav   7.0.0  any  a2a18f5ad36d133c74bf9106b6445806fa253b09141a46392550394b647b221e  https://download.videolan.org/pub/videolan/libdvdnav/7.0.0/libdvdnav-7.0.0.tar.xz  videolan .sha256
+libudfread  1.2.0  any  e3ed8dc7fab472ad382b1b6cd068f1dc0084c34e5ec2c460c1dd84fa14a9d368c4d7af08a23efc5057e7f021f5812222c01247d5f304632716c94fc8c689a1a2  https://download.videolan.org/pub/videolan/libudfread/libudfread-1.2.0.tar.xz  videolan .sha512
+libbluray   1.5.0  any  f676408e91a5d321abf8b8d4dfdae36205c297dab5c54c3ec519639025f474a2  https://download.videolan.org/pub/videolan/libbluray/1.5.0/libbluray-1.5.0.tar.xz  videolan .sha256
+freetype    2.14.3 any  36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f  https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz  computed on first HTTPS download (GPG .sig not checked)
+fontconfig  2.16.0 any  6a33dc555cc9ba8b10caf7695878ef134eeb36d0af366041f639b1da9b6ed220  https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.16.0.tar.xz  freedesktop .sha256sum
+expat       2.10.0 any  c624ba2998fc65df1163a49641ff3f9ab73138b11641d92c86bee0fb01b1bc7f  https://github.com/libexpat/libexpat/releases/download/R_2_10_0/expat-2.10.0.tar.xz  GitHub release asset digest
+ant         1.10.18 any c510d744876d8da48dabc9495b023b6ec5284a0f18b40ee50d98ce099e791ca5c73e3cd4c80d3c90d3efc03f9620be43aad0a373ed47198284f7e3373e0db2c3  https://archive.apache.org/dist/ant/binaries/apache-ant-1.10.18-bin.tar.gz  apache .sha512
+temurin-jdk 21.0.13+9 macos-aarch64 bf036b35b071bfb2f54f2c0af8ee8d88afa95ee6eb3dce02c0f94cfc2524d04a  https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.13_9.tar.gz  Adoptium API checksum
+temurin-jdk 21.0.13+9 linux-x86_64  d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c  https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz  Adoptium API checksum
+temurin-jdk 21.0.13+9 linux-aarch64 e3522e707fc7dbe2a72c30746b1e7068301a0213ecd213d4491f35a14eb55578  https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.13_9.tar.gz  Adoptium API checksum

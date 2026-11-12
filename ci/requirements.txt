@@ -1,0 +1,3 @@
+# Build tools installed with pip --require-hashes (Debian bookworm's meson is
+# too old for fontconfig 2.16).
+meson==1.9.1 --hash=sha256:f824ab770c041a202f532f69e114c971918ed2daff7ea56583d80642564598d0

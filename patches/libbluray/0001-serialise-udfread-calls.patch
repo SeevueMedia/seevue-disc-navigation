@@ -1,0 +1,93 @@
+--- a/src/libbluray/disc/udf_fs.c	2026-07-17 10:55:51
++++ b/src/libbluray/disc/udf_fs.c	2026-11-08 23:41:55
+@@ -26,6 +26,16 @@
+ #include "file/file.h"
+ #include "util/macro.h"
+ #include "util/mutex.h"
++
++#include <pthread.h>
++
++/* libudfread is not safe for concurrent use of one image, and BD-J
++ * copies its files (VFS cache) from Java threads while the player reads the
++ * stream. Serialise every libudfread call (block reads below keep their own
++ * lock). Without this, BD-J start-up failed intermittently: the disc's
++ * application found a cached image corrupt ("failed: Addendum.png"). */
++static pthread_mutex_t udf_call_lock = PTHREAD_MUTEX_INITIALIZER;
++#define UDF_LOCKED(expr) (pthread_mutex_lock(&udf_call_lock), _udf_r = (expr), pthread_mutex_unlock(&udf_call_lock), _udf_r)
+ #include "util/logging.h"
+ 
+ #ifdef HAVE_LIBUDFREAD
+@@ -48,7 +58,9 @@
+ static void _file_close(BD_FILE_H *file)
+ {
+     if (file) {
++        pthread_mutex_lock(&udf_call_lock);
+         udfread_file_close((UDFFILE*)file->internal);
++        pthread_mutex_unlock(&udf_call_lock);
+         BD_DEBUG(DBG_FILE, "Closed UDF file (%p)\n", (void*)file);
+         X_FREE(file);
+     }
+@@ -56,17 +68,20 @@
+ 
+ static int64_t _file_seek(BD_FILE_H *file, int64_t offset, int32_t origin)
+ {
+-    return udfread_file_seek((UDFFILE*)file->internal, offset, origin);
++    int64_t _udf_r;
++    return UDF_LOCKED(udfread_file_seek((UDFFILE*)file->internal, offset, origin));
+ }
+ 
+ static int64_t _file_tell(BD_FILE_H *file)
+ {
+-    return udfread_file_tell((UDFFILE*)file->internal);
++    int64_t _udf_r;
++    return UDF_LOCKED(udfread_file_tell((UDFFILE*)file->internal));
+ }
+ 
+ static int64_t _file_read(BD_FILE_H *file, uint8_t *buf, int64_t size)
+ {
+-    return udfread_file_read((UDFFILE*)file->internal, buf, size);
++    ssize_t _udf_r;
++    return UDF_LOCKED(udfread_file_read((UDFFILE*)file->internal, buf, size));
+ }
+ 
+ BD_FILE_H *bdpriv_udf_file_open(void *udf, const char *filename)
+@@ -85,7 +100,9 @@
+     file->tell  = _file_tell;
+     file->eof   = NULL;
+ 
++    pthread_mutex_lock(&udf_call_lock);
+     file->internal = udfread_file_open((udfread*)udf, filename);
++    pthread_mutex_unlock(&udf_call_lock);
+     if (!file->internal) {
+         BD_DEBUG(DBG_FILE, "Error opening file %s!\n", filename);
+         X_FREE(file);
+@@ -101,7 +118,9 @@
+ static void _dir_close(BD_DIR_H *dir)
+ {
+     if (dir) {
++        pthread_mutex_lock(&udf_call_lock);
+         udfread_closedir((UDFDIR*)dir->internal);
++        pthread_mutex_unlock(&udf_call_lock);
+         BD_DEBUG(DBG_DIR, "Closed UDF dir (%p)\n", (void*)dir);
+         X_FREE(dir);
+     }
+@@ -111,7 +130,8 @@
+ {
+     struct udfread_dirent e;
+ 
+-    if (!udfread_readdir((UDFDIR*)dir->internal, &e)) {
++    struct udfread_dirent *_udf_r;
++    if (!UDF_LOCKED(udfread_readdir((UDFDIR*)dir->internal, &e))) {
+         return 1;
+     }
+ 
+@@ -133,7 +153,9 @@
+     dir->close = _dir_close;
+     dir->read  = _dir_read;
+ 
++    pthread_mutex_lock(&udf_call_lock);
+     dir->internal = udfread_opendir((udfread*)udf, dirname);
++    pthread_mutex_unlock(&udf_call_lock);
+     if (!dir->internal) {
+         BD_DEBUG(DBG_DIR, "Error opening %s\n", dirname);
+         X_FREE(dir);
