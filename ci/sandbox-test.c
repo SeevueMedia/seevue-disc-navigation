@@ -21,6 +21,9 @@
 static void *thread(void *value) { return value; }
 int main(int argc, char **argv) {
   assert(argc == 3);
+  errno = 0;
+  int priority_before = getpriority(PRIO_PROCESS, 0);
+  assert(errno == 0);
   #ifdef __linux__
   if (!strcmp(argv[1], "missing")) {
     struct sock_filter filter[] = {
@@ -80,7 +83,9 @@ int main(int argc, char **argv) {
   assert(getrlimit(RLIMIT_AS, &limit) == 0 && limit.rlim_max == 536870912);
   #endif
   assert(getrlimit(RLIMIT_CPU, &limit) == 0 && limit.rlim_max == 10);
-  assert(getpriority(PRIO_PROCESS, 0) >= 10);
+  int expected_priority = priority_before + 10;
+  if (expected_priority > 19) expected_priority = 19;
+  assert(getpriority(PRIO_PROCESS, 0) >= expected_priority);
   #ifdef __linux__
   assert(syscall(SYS_prlimit64, getppid(), RLIMIT_NOFILE, NULL, &limit) == -1);
   struct rlimit raise = {128, 128};

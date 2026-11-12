@@ -26,6 +26,7 @@ else
 (allow file-read-metadata)
 (allow file-read* file-write* (subpath "$tmp/work"))
 (allow sysctl-read)
+(allow process-info* (target self))
 (allow system-sched (target self))
 (allow signal (target self))
 PROFILE
