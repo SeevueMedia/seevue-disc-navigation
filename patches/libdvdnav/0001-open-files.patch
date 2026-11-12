@@ -1,0 +1,123 @@
+navd: open a DVD folder tree through the caller's file system.
+
+libdvdread 7.1.1 has DVDOpenFiles (a dvd_reader_filesystem_h of stat, dir and
+file callbacks) but libdvdnav 7.0.0 cannot pass one through. This adds
+dvdnav_open_files(), so navd reads a disc folder through the Seevue read
+service instead of by path.
+
+diff --git a/src/dvdnav/dvdnav.h b/src/dvdnav/dvdnav.h
+index 8e04742..e92eba4 100644
+--- a/src/dvdnav/dvdnav.h
++++ b/src/dvdnav/dvdnav.h
+@@ -43,6 +43,7 @@ extern "C" {
+ #include <dvdnav/version.h>
+ #include <dvdnav/dvd_types.h>
+ #include <dvdread/dvd_reader.h>
++#include <dvdread/dvd_filesystem.h>
+ #include <dvdread/nav_types.h>
+ #include <dvdnav/dvdnav_events.h>
+ 
+@@ -120,6 +121,15 @@ DVDNAV_API dvdnav_status_t dvdnav_open_stream2(dvdnav_t **dest,
+                                     void *priv, const dvdnav_logger_cb *,
+                                     dvdnav_stream_cb *stream_cb);
+ 
++/*
++ * Opens a DVD folder tree at path through the caller's file system
++ * (libdvdread's DVDOpenFiles). fs must outlive the dvdnav_t.
++ */
++DVDNAV_API dvdnav_status_t dvdnav_open_files(dvdnav_t **dest,
++                                  void *priv, const dvdnav_logger_cb *,
++                                  const char *path,
++                                  dvd_reader_filesystem_h *fs);
++
+ DVDNAV_API dvdnav_status_t dvdnav_dup(dvdnav_t **dest, dvdnav_t *src);
+ DVDNAV_API dvdnav_status_t dvdnav_free_dup(dvdnav_t * _this);
+ 
+diff --git a/src/dvdnav.c b/src/dvdnav.c
+index f24c5d3..688c142 100644
+--- a/src/dvdnav.c
++++ b/src/dvdnav.c
+@@ -151,7 +151,8 @@ dvdnav_status_t dvdnav_free_dup(dvdnav_t *this) {
+ static dvdnav_status_t dvdnav_open_common(dvdnav_t** dest,
+                                           void *priv, const dvdnav_logger_cb *logcb,
+                                           const char *path,
+-                                          dvdnav_stream_cb *stream_cb) {
++                                          dvdnav_stream_cb *stream_cb,
++                                          dvd_reader_filesystem_h *fs) {
+   dvdnav_t *this;
+   struct timeval time;
+ 
+@@ -174,6 +175,7 @@ static dvdnav_status_t dvdnav_open_common(dvdnav_t** dest,
+   if(!this->vm) {
+     goto fail;
+   }
++  this->vm->fs = fs;
+   if(!vm_reset(this->vm, path, priv, stream_cb)) {
+     goto fail;
+   }
+@@ -213,24 +215,33 @@ fail:
+ }
+ 
+ dvdnav_status_t dvdnav_open(dvdnav_t** dest, const char *path) {
+-  return dvdnav_open_common(dest, NULL, NULL, path, NULL);
++  return dvdnav_open_common(dest, NULL, NULL, path, NULL, NULL);
+ }
+ 
+ dvdnav_status_t dvdnav_open2(dvdnav_t** dest,
+                              void *priv,const dvdnav_logger_cb *logcb,
+                              const char *path) {
+-  return dvdnav_open_common(dest, priv, logcb, path, NULL);
++  return dvdnav_open_common(dest, priv, logcb, path, NULL, NULL);
+ }
+ 
+ dvdnav_status_t dvdnav_open_stream(dvdnav_t** dest,
+                                    void *priv, dvdnav_stream_cb *stream_cb) {
+-  return dvdnav_open_common(dest, priv, NULL, NULL, stream_cb);
++  return dvdnav_open_common(dest, priv, NULL, NULL, stream_cb, NULL);
+ }
+ 
+ dvdnav_status_t dvdnav_open_stream2(dvdnav_t** dest,
+                                     void *priv,const dvdnav_logger_cb *logcb,
+                                     dvdnav_stream_cb *stream_cb) {
+-  return dvdnav_open_common(dest, priv, logcb, NULL, stream_cb);
++  return dvdnav_open_common(dest, priv, logcb, NULL, stream_cb, NULL);
++}
++
++dvdnav_status_t dvdnav_open_files(dvdnav_t** dest,
++                                  void *priv, const dvdnav_logger_cb *logcb,
++                                  const char *path,
++                                  dvd_reader_filesystem_h *fs) {
++  if(!path || !fs)
++    return DVDNAV_STATUS_ERR;
++  return dvdnav_open_common(dest, priv, logcb, path, NULL, fs);
+ }
+ 
+ dvdnav_status_t dvdnav_close(dvdnav_t *this) {
+diff --git a/src/vm/vm.c b/src/vm/vm.c
+index 9276c91..4acfcc1 100644
+--- a/src/vm/vm.c
++++ b/src/vm/vm.c
+@@ -426,7 +426,9 @@ int vm_reset(vm_t *vm, const char *dvdroot,
+     dvd_logger_cb dvdread_logcb = { .pf_log = dvd_reader_logger_handler };
+     /* Only install log handler if we have one ourself */
+     dvd_logger_cb *p_dvdread_logcb = vm->logcb.pf_log ? &dvdread_logcb : NULL;
+-    if(dvdroot)
++    if(dvdroot && vm->fs)
++        vm->dvd = DVDOpenFiles(vm, p_dvdread_logcb, dvdroot, vm->fs);
++    else if(dvdroot)
+         vm->dvd = DVDOpen2(vm, p_dvdread_logcb, dvdroot);
+     else if(vm->priv && vm->dvdstreamcb.pf_read)
+         vm->dvd = DVDOpenStream2(vm, p_dvdread_logcb, &vm->dvdstreamcb);
+diff --git a/src/vm/vm.h b/src/vm/vm.h
+index bada9f0..7fd3433 100644
+--- a/src/vm/vm.h
++++ b/src/vm/vm.h
+@@ -79,6 +79,8 @@ typedef struct {
+   char          dvd_name[50];
+   char          dvd_serial[15];
+   int           stopped;
++  /* The caller's file system for a folder tree (dvdnav_open_files), or NULL. */
++  dvd_reader_filesystem_h *fs;
+ } vm_t;
+ 
+ /* magic number for seeking hops */

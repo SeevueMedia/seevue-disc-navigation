@@ -3,7 +3,7 @@ Source code
 
 The complete corresponding source code for navd and bdnavd, the build
 script, the pinned source list (sources.lock, with the SHA-256 of every
-upstream tarball) and the libbluray patches are published at
+upstream tarball) and the libbluray and libdvdnav patches are published at
 
   https://github.com/SeevueMedia/seevue-disc-navigation
 

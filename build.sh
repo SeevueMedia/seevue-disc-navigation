@@ -168,7 +168,12 @@ if ! stamp dvdread; then
   done_ dvdread
 fi
 if ! stamp dvdnav; then
-  meson_build dvdnav "$(unpack libdvdnav)" -Ddefault_library=static -Denable_docs=false
+  d="$(unpack libdvdnav)"
+  # dvdnav_open_files: disc folders through the read service (navd).
+  for pt in "$ROOT"/patches/libdvdnav/*.patch; do
+    patch -s -p1 -N -d "$d" < "$pt"
+  done
+  meson_build dvdnav "$d" -Ddefault_library=static -Denable_docs=false
   done_ dvdnav
 fi
 
@@ -188,7 +193,7 @@ NAVD_EXTRA=()
 [[ "$OS" == linux ]] && NAVD_EXTRA=(-Wno-attributes)
 cc "${WARN[@]}" ${NAVD_EXTRA[@]+"${NAVD_EXTRA[@]}"} -include "$ROOT/src/navd_version_check.h" \
   -I"$PREFIX/include" -I"$SRC/libdvdnav/src" -I"$WORK/build-dvdnav" \
-  "$ROOT/src/navd.c" "$PREFIX/lib/libdvdnav.a" "$PREFIX/lib/libdvdread.a" \
+  "$ROOT/src/navd.c" "$ROOT/src/readsvc.c" "$PREFIX/lib/libdvdnav.a" "$PREFIX/lib/libdvdread.a" \
   $([[ "$OS" == linux ]] && echo -lpthread) -o "$STAGE/bin/navd"
 
 if [[ "$OS" == macos ]]; then
@@ -200,7 +205,7 @@ fi
 # clock_gettime under -std=c11 without one (macOS shows them by default).
 BDNAVD_EXTRA=()
 [[ "$OS" == linux ]] && BDNAVD_EXTRA=(-D_GNU_SOURCE)
-cc "${WARN[@]}" ${BDNAVD_EXTRA[@]+"${BDNAVD_EXTRA[@]}"} -I"$PREFIX/include" "$ROOT/src/bdnavd.c" -L"$PREFIX/lib" -lbluray -lpthread \
+cc "${WARN[@]}" ${BDNAVD_EXTRA[@]+"${BDNAVD_EXTRA[@]}"} -I"$PREFIX/include" "$ROOT/src/bdnavd.c" "$ROOT/src/readsvc.c" -L"$PREFIX/lib" -lbluray -lpthread \
   "${RPATH[@]}" -o "$STAGE/bin/bdnavd"
 
 # Shared libraries under their sonames, found through the rpath.

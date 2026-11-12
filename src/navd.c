@@ -3,9 +3,10 @@
  *
  * Runs libdvdnav's DVD virtual machine over a decrypted DVD-Video image for
  * one viewing session, under a supervising server. This process never
- * opens paths of its own choosing: the disc arrives as an already-open file descriptor (fd 3).
- * An image (regular file) is read through stream callbacks; a disc folder (a directory holding
- * VIDEO_TS, or VIDEO_TS itself) is opened by libdvdread from the path the descriptor refers to.
+ * opens the disc itself: it reads it through the server's read service
+ * (readsvc.h, fds 3 and 4). An image is read through libdvdread's stream
+ * callbacks; a disc folder (VIDEO_TS inside) through libdvdread's file-system
+ * callbacks (DVDOpenFiles, passed through by patches/libdvdnav).
  *
  * Licence: links libdvdnav and libdvdread (GPL-2.0-or-later), so this program
  * is GPL-2.0-or-later.
@@ -34,7 +35,6 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdint.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,12 +51,15 @@
 #include "vm/decoder.h"
 #include "vm/vm.h"
 #include "dvdnav_internal.h"
+#include "readsvc.h"
 
 #define SECTOR 2048
 #define MAX_BATCH 512          /* sectors per 'D' frame and per 'N' command */
 #define PCI_RING 64
 #define JSON_MAX 16384
-#define IMAGE_FD 3
+/* The disc folder's root as libdvdread sees it; every path under it goes to
+   the read service relative to the disc root. */
+#define FOLDER_ROOT "/disc"
 
 static dvdnav_t *nav;
 
@@ -194,16 +197,95 @@ static int image_seek(void *priv, uint64_t pos) {
 static int image_read(void *priv, void *buffer, int len) {
   (void)priv;
   if (len <= 0) return 0;
-  ssize_t r;
-  do {
-    r = pread(IMAGE_FD, buffer, (size_t)len, (off_t)image_pos);
-  } while (r < 0 && errno == EINTR);
-  if (r < 0) return -1;
+  int64_t r = rs_read(image_pos, buffer, (size_t)len);
+  if (r < 0) {
+    snprintf(last_error, sizeof last_error, "read_failed at %" PRIu64, image_pos);
+    return -1;
+  }
   image_pos += (uint64_t)r;
   return (int)r;
 }
 
 static dvdnav_stream_cb stream_cb = {image_seek, image_read, NULL};
+
+/* ---------- folder file system (read service) ---------- */
+
+static int fs_rel(const char *path, char *rel) {
+  return rs_relative(FOLDER_ROOT, path, rel, RS_MAX_PATH + 1);
+}
+
+static void fs_close_cb(dvd_reader_filesystem_h *fs) { (void)fs; }
+
+static int fs_stat(dvd_reader_filesystem_h *fs, const char *path, dvdstat_t *st) {
+  (void)fs;
+  char rel[RS_MAX_PATH + 1];
+  int is_dir = 0;
+  uint64_t size = 0;
+  if (fs_rel(path, rel) < 0 || rs_stat(rel, &is_dir, &size) != RS_OK) return -1;
+  st->size = size;
+  st->st_mode = is_dir ? DVD_S_IFDIR : DVD_S_IFREG;
+  return 0;
+}
+
+static void *fs_dir_open(dvd_reader_filesystem_h *fs, const char *dirname) {
+  (void)fs;
+  char rel[RS_MAX_PATH + 1];
+  rs_list *list = calloc(1, sizeof *list);
+  if (!list || fs_rel(dirname, rel) < 0 || rs_list_open(rel, list) != RS_OK) {
+    free(list);
+    return NULL;
+  }
+  return list;
+}
+
+static int fs_dir_read(void *dir, dvd_dirent_t *entry) {
+  return rs_list_next(dir, entry->d_name, sizeof entry->d_name);
+}
+
+static void fs_dir_close(void *dir) {
+  if (!dir) return;
+  rs_list_free(dir);
+  free(dir);
+}
+
+static void *fs_file_open(dvd_reader_filesystem_h *fs, const char *filename) {
+  (void)fs;
+  char rel[RS_MAX_PATH + 1];
+  rs_file *file = calloc(1, sizeof *file);
+  if (!file || fs_rel(filename, rel) < 0 || rs_open(rel, file) != RS_OK) {
+    free(file);
+    return NULL;
+  }
+  return file;
+}
+
+static ssize_t fs_file_read(void *file, char *buf, size_t size) {
+  int64_t r = rs_fread(file, buf, size);
+  if (r < 0) snprintf(last_error, sizeof last_error, "read_failed in a disc file");
+  return (ssize_t)r;
+}
+
+static off64_t fs_file_seek(void *file, off64_t offset, int whence) {
+  rs_file *f = file;
+  if (whence != SEEK_SET && whence != SEEK_CUR && whence != SEEK_END) return -1;
+  int64_t base = whence == SEEK_CUR ? (int64_t)f->pos : whence == SEEK_END ? (int64_t)f->size : 0;
+  int64_t to = base + (int64_t)offset;
+  if (to < 0) return -1;
+  f->pos = (uint64_t)to;
+  return (off64_t)to;
+}
+
+static int fs_file_close(void *file) {
+  if (!file) return 0;
+  rs_close(file);
+  free(file);
+  return 0;
+}
+
+static dvd_reader_filesystem_h folder_fs = {
+    NULL, fs_close_cb, fs_stat, fs_dir_open, fs_dir_read, fs_dir_close,
+    fs_file_open, fs_file_read, fs_file_seek, fs_file_close,
+};
 
 static void log_cb(void *priv, dvdnav_logger_level_t level, const char *fmt, va_list args) {
   (void)priv;
@@ -313,21 +395,6 @@ static void event_nav(const pci_t *pci, const dsi_t *dsi, uint32_t id) {
 
 /* ---------- commands ---------- */
 
-/* The path a descriptor refers to: F_GETPATH on macOS, /proc on Linux. */
-static int fd_path(int fd, char *out, size_t size) {
-#ifdef F_GETPATH
-  (void)size;
-  return fcntl(fd, F_GETPATH, out);
-#else
-  char link[32];
-  snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
-  ssize_t n = readlink(link, out, size - 1);
-  if (n <= 0 || (size_t)n >= size - 1) return -1;
-  out[n] = 0;
-  return 0;
-#endif
-}
-
 static void cmd_open(const uint8_t *p, uint32_t len) {
   if (nav) {
     reply_error("already_open");
@@ -337,25 +404,18 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
     reply_error("bad_open");
     return;
   }
-  struct stat st;
-  if (fstat(IMAGE_FD, &st) != 0 || !(S_ISREG(st.st_mode) || S_ISDIR(st.st_mode))) {
-    reply_error("no_image_fd");
+  int layout = 0;
+  if (rs_info(&layout, &image_size) != 0) {
+    reply_error("no_disc");
     return;
   }
-  if (S_ISDIR(st.st_mode)) {
-    /* A disc folder: the path the server opened, recovered from the descriptor. */
-    char dir[PATH_MAX];
-    if (fd_path(IMAGE_FD, dir, sizeof dir) == -1) {
-      reply_error("no_folder_path");
-      return;
-    }
-    if (dvdnav_open2(&nav, NULL, &logger, dir) != DVDNAV_STATUS_OK || !nav) {
+  if (layout == RS_FOLDER) {
+    if (dvdnav_open_files(&nav, NULL, &logger, FOLDER_ROOT, &folder_fs) != DVDNAV_STATUS_OK || !nav) {
       nav = NULL;
       reply_error("open_failed");
       return;
     }
   } else {
-    image_size = (uint64_t)st.st_size;
     /* libdvdread takes the stream path only with a non-NULL private pointer (dvd_reader.c). */
     if (dvdnav_open_stream2(&nav, &image_pos, &logger, &stream_cb) != DVDNAV_STATUS_OK || !nav) {
       nav = NULL;
@@ -676,7 +736,7 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
 int main(void) {
   static uint8_t payload[256];
   /* Protocol v1: the hello, once, before any command is read. */
-  static const char hello[] = "{\"protocol\":1,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
+  static const char hello[] = "{\"protocol\":2,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
   frame('H', hello, (uint32_t)(sizeof hello - 1));
   for (;;) {
     uint8_t head[5];
