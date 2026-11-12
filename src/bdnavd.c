@@ -390,9 +390,7 @@ static atomic_int argb_woken;      /* a wake notice is out for changes not yet s
    libbluray's BD-J ("failed: Addendum.png", an image load on an intact cached
    file; more often while the stream is being read); a menu call restarted it
    every time in testing (results/c9). */
-#define BDJ_RETRY_MS 5000
-/* Restarts per disc session, for either reason: one, then a clear error. */
-#define BDJ_RESTARTS 1
+#include "bdj_retry.h"
 static int bdj_restarts;
 static uint64_t bdj_started_at;
 static uint64_t bdj_bytes;        /* stream read since the BD-J title started */
@@ -765,28 +763,18 @@ static void bdj_watch(void) {
     return;
   }
   int start_failed = atomic_exchange(&bdj_start_failed, 0);
-  if (start_failed && bdj_restarts >= BDJ_RESTARTS) { bdj_report("start", "start"); return; }
-  if (start_failed) {
-    bdj_restarts++;
-    fprintf(stderr, "bdnavd: BD-J application failed to start; menu call to restart it (%d/%d)\n",
-            bdj_restarts, BDJ_RESTARTS);
-    bdj_report("restart", "start");
-    bd_menu_call(bd, -1);
-    return;
-  }
-  if (!bdj_started_at) return;
   pthread_mutex_lock(&argb_state);
   int drawn = argb_flushed;
   pthread_mutex_unlock(&argb_state);
-  /* Drawing or playing video: the application is running (some play intros first). */
-  if (drawn || bdj_bytes > 0) { bdj_started_at = 0; return; }
-  if (mono_ms() - bdj_started_at < BDJ_RETRY_MS) return;
-  if (bdj_restarts >= BDJ_RESTARTS) { bdj_started_at = 0; return; }
-  bdj_restarts++;
-  fprintf(stderr, "bdnavd: BD-J title drew nothing in %d ms; menu call to restart it (%d/%d)\n",
-          BDJ_RETRY_MS, bdj_restarts, BDJ_RESTARTS);
+  enum bdj_retry_action action = bdj_retry_step(&bdj_restarts, &bdj_started_at,
+                                               start_failed, drawn || bdj_bytes > 0, mono_ms());
+  if (action == BDJ_WAIT) return;
+  const char *reason = start_failed ? "start" : "no_draw";
+  if (action == BDJ_FAILED) { bdj_report("start", reason); return; }
+  fprintf(stderr, "bdnavd: BD-J start failed (%s); menu call to restart it (%d/%d)\n",
+          reason, bdj_restarts, BDJ_RESTARTS);
+  bdj_report("restart", reason);
   bd_menu_call(bd, -1);
-  bdj_started_at = mono_ms();
 }
 
 static void drain_events(void) {
