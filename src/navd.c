@@ -16,7 +16,8 @@
  * exactly one 'R' frame.
  *
  *   Commands (server -> navd)
- *     'O' open    u32 region_mask, u8 parental_level, 6 bytes menu/audio/spu language
+ *     'O' open    u32 region_mask, u8 parental_level, 6 bytes menu/audio/spu language,
+ *                 u16 SPRM 14 (the display: aspect in bits 10-11, mode in bits 8-9)
  *     'N' next    u32 max_blocks: read until max_blocks, a still, wait, hop, title-set change or stop
  *     'B' button  u8 op (1 up 2 down 3 left 4 right 5 activate 6 select), u8 button, u32 pci_id
  *     'M' menu    u8 DVDMenuID_t
@@ -24,6 +25,12 @@
  *     'T' play    u16 title, u16 part (0 plays the title from its start)
  *     'R' resync  u32 pci_id: move the VM to that PCI's VOBU (the picture on screen),
  *                 so a following menu call saves the displayed position for resume
+ *     'L' subtitles u8 op: 0 hide, 1 the next stream the title has (after the last: hide)
+ *     'J' seek    u64 90 kHz time in the current program chain
+ *     'V' angle   u8 angle (1-based; 0 the next one)
+ *   Commands the disc forbids here (its user-operation masks) are refused with
+ *   "uop_prohibited". A read that reaches CSS-scrambled sectors (an encrypted
+ *   disc) is refused with "encrypted".
  *   Replies (navd -> server)
  *     'D' data    n * 2048-byte sectors, in delivery order
  *     'E' event   one JSON object
@@ -330,7 +337,11 @@ static void j_position(void) {
   dvdnav_get_current_highlight(nav, &button);
   uint32_t w = 0, h = 0;
   dvdnav_get_video_resolution(nav, &w, &h);
+  int32_t angle = 1, angles = 1;
+  dvdnav_get_angle_info(nav, &angle, &angles);
   j("\"domain\":\"%s\",\"title\":%d,\"part\":%d,\"button\":%d,", domain(), title, part, button);
+  j("\"angle\":%d,\"angles\":%d,\"spu_on\":%d,", angle, angles,
+    (nav->vm->state.registers.SPRM[2] & 0x40) ? 1 : 0);
   j("\"audio\":%d,\"spu\":%d,\"aspect\":%u,\"scale\":%u,\"width\":%u,\"height\":%u",
     dvdnav_get_active_audio_stream(nav), dvdnav_get_active_spu_stream(nav),
     dvdnav_get_video_aspect(nav), dvdnav_get_video_scale_permission(nav), w, h);
@@ -393,6 +404,18 @@ static void event_nav(const pci_t *pci, const dsi_t *dsi, uint32_t id) {
   j_end('E');
 }
 
+/* A sector still CSS-scrambled: its PES header's scrambling control bits are
+   set (descrambling clears them). Decrypted discs play; this one cannot. */
+static int scrambled(const uint8_t *s) {
+  if (s[0] != 0 || s[1] != 0 || s[2] != 1 || s[3] != 0xBA) return 0;
+  size_t pes = 14 + (s[13] & 7);
+  if (pes + 7 > SECTOR) return 0;
+  const uint8_t *p = s + pes;
+  int id = p[3];
+  int media = id == 0xE0 || id == 0xBD || (id & 0xE0) == 0xC0;
+  return p[0] == 0 && p[1] == 0 && p[2] == 1 && media && (p[6] & 0xC0) == 0x80 && (p[6] & 0x30) != 0;
+}
+
 /* ---------- commands ---------- */
 
 static void cmd_open(const uint8_t *p, uint32_t len) {
@@ -400,7 +423,7 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
     reply_error("already_open");
     return;
   }
-  if (len < 4 + 1 + 6) {
+  if (len < 4 + 1 + 6 + 2) {
     reply_error("bad_open");
     return;
   }
@@ -433,15 +456,19 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
   dvdnav_audio_language_select(nav, audio);
   pref_audio = (uint16_t)(((uint8_t)audio[0] << 8) | (uint8_t)audio[1]);
   dvdnav_spu_language_select(nav, spu);
-  /* SPRM13 parental level; SPRM14 display preference: 16:9 wide (3 << 10), normal mode. */
+  /* SPRM 13 parental level; SPRM 14 the viewer's display, from the session. */
   nav->vm->state.registers.SPRM[13] = p[4];
-  nav->vm->state.registers.SPRM[14] = 3 << 10;
+  nav->vm->state.registers.SPRM[14] = (uint16_t)(p[11] | (p[12] << 8)) & 0x0f00;
+  /* libdvdnav does not enforce the disc's regions: report them for the server. */
+  int32_t disc_regions = 0xff;
+  if (dvdnav_get_disk_region_mask(nav, &disc_regions) != DVDNAV_STATUS_OK) disc_regions = 0xff;
   int32_t titles = 0;
   dvdnav_get_number_of_titles(nav, &titles);
   const char *volid = NULL;
   dvdnav_get_title_string(nav, &volid);
   j_begin();
-  j("\"ok\":true,\"titles\":%d,\"image_bytes\":%" PRIu64 ",\"volume\":\"", titles, image_size);
+  j("\"ok\":true,\"titles\":%d,\"image_bytes\":%" PRIu64 ",\"disc_regions\":%d,\"volume\":\"", titles,
+    image_size, disc_regions & 0xff);
   for (const char *c = volid ? volid : ""; *c; c++)
     if (*c >= 0x20 && *c < 0x7f && *c != '"' && *c != '\\') j("%c", *c);
   j("\"");
@@ -468,6 +495,12 @@ static void cmd_next(const uint8_t *p, uint32_t len) {
     }
     switch (event) {
       case DVDNAV_BLOCK_OK:
+        if (scrambled(block)) {
+          /* Nothing scrambled is delivered. */
+          batch_n = 0;
+          reply_error("encrypted");
+          return;
+        }
         memcpy(batch + batch_n * SECTOR, block, SECTOR);
         batch_n++;
         delivered++;
@@ -682,9 +715,76 @@ static void cmd_resync(const uint8_t *p, uint32_t len) {
   j_end('R');
 }
 
+/* The user operations the disc forbids now: the program chain's and the
+   current VOBU's masks together. */
+static user_ops_t uops(void) {
+  user_ops_t u;
+  memset(&u, 0, sizeof u);
+  if (nav->vm->state.pgc) u = nav->vm->state.pgc->prohibited_ops;
+  pci_t *pci = dvdnav_get_current_nav_pci(nav);
+  if (pci) {
+    const uint8_t *a = (const uint8_t *)&pci->pci_gi.vobu_uop_ctl;
+    uint8_t *b = (uint8_t *)&u;
+    for (size_t i = 0; i < sizeof u; i++) b[i] |= a[i];
+  }
+  return u;
+}
+
+/* Is the command forbidden by the disc? */
+static int prohibited(char c, const uint8_t *p, uint32_t len) {
+  user_ops_t u = uops();
+  switch (c) {
+    case 'M':
+      if (len < 1) return 0;
+      switch (p[0]) {
+        case DVD_MENU_Title: return u.title_menu_call;
+        case DVD_MENU_Root: return u.root_menu_call;
+        case DVD_MENU_Subpicture: return u.subpic_menu_call;
+        case DVD_MENU_Audio: return u.audio_menu_call;
+        case DVD_MENU_Angle: return u.angle_menu_call;
+        case DVD_MENU_Part: return u.chapter_menu_call;
+        default: return 0;
+      }
+    case 'U': return u.go_up;
+    case 'P': return len >= 1 && (p[0] == 2 ? u.next_pg_search : u.prev_or_top_pg_search);
+    case 'A': return u.audio_stream_change;
+    case 'L': return u.subpic_stream_change;
+    case 'J': return u.time_or_chapter_search;
+    case 'V': return u.angle_change;
+    default: return 0;
+  }
+}
+
+/* 'L': op 0 hides subtitles; 1 shows the next stream the program chain has,
+   or hides them after its last. */
+static dvdnav_status_t subtitles(uint8_t op) {
+  if (op == 0) return dvdnav_toggle_spu_stream(nav, 0);
+  uint16_t sprm2 = nav->vm->state.registers.SPRM[2];
+  int on = (sprm2 & 0x40) != 0, cur = sprm2 & 0x3f;
+  int first = -1, next = -1;
+  for (int i = 0; i < 32; i++) {
+    if (dvdnav_get_spu_logical_stream(nav, (uint8_t)i) < 0) continue;
+    if (first < 0) first = i;
+    if (on && i > cur) { next = i; break; }
+  }
+  if (first < 0) {
+    snprintf(last_error, sizeof last_error, "no_subtitles");
+    return DVDNAV_STATUS_ERR;
+  }
+  int want = on ? next : first;
+  if (want < 0) return dvdnav_toggle_spu_stream(nav, 0);
+  if (dvdnav_set_active_stream(nav, (uint8_t)want, DVD_SUBTITLE_STREAM) != DVDNAV_STATUS_OK)
+    return DVDNAV_STATUS_ERR;
+  return dvdnav_toggle_spu_stream(nav, 1);
+}
+
 static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
   if (!nav) {
     reply_error("not_open");
+    return;
+  }
+  if (prohibited(c, p, len)) {
+    reply_error("uop_prohibited");
     return;
   }
   dvdnav_status_t st = DVDNAV_STATUS_OK;
@@ -718,6 +818,29 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
       if (len < 1) { reply_error("bad_audio"); return; }
       st = dvdnav_set_active_stream(nav, p[0], DVD_AUDIO_STREAM);
       break;
+    case 'L':
+      if (len < 1 || p[0] > 1) { reply_error("bad_subtitles"); return; }
+      if (!dvdnav_is_domain_vts(nav)) { reply_error("not_in_title"); return; }
+      last_error[0] = 0;
+      st = subtitles(p[0]);
+      if (st != DVDNAV_STATUS_OK && !strcmp(last_error, "no_subtitles")) { reply_error("no_subtitles"); return; }
+      break;
+    case 'J': {
+      if (len < 8) { reply_error("bad_seek"); return; }
+      uint64_t t = 0;
+      for (int i = 7; i >= 0; i--) t = (t << 8) | p[i];
+      if (!dvdnav_is_domain_vts(nav)) { reply_error("not_in_title"); return; }
+      st = dvdnav_time_search(nav, t);
+      break;
+    }
+    case 'V': {
+      if (len < 1) { reply_error("bad_angle"); return; }
+      int32_t cur = 1, num = 1;
+      dvdnav_get_angle_info(nav, &cur, &num);
+      if (num <= 1) { reply_error("no_angles"); return; }
+      st = dvdnav_angle_change(nav, p[0] ? p[0] : (cur % num) + 1);
+      break;
+    }
     case 'Q': break;
     default: reply_error("bad_command"); return;
   }
@@ -735,8 +858,8 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
 
 int main(void) {
   static uint8_t payload[256];
-  /* Protocol v1: the hello, once, before any command is read. */
-  static const char hello[] = "{\"protocol\":2,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
+  /* The hello, once, before any command is read. */
+  static const char hello[] = "{\"protocol\":3,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
   frame('H', hello, (uint32_t)(sizeof hello - 1));
   for (;;) {
     uint8_t head[5];

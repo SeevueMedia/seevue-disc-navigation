@@ -1,0 +1,123 @@
+libdvdread: use an information file's backup when the two differ.
+
+libdvdread falls back to VIDEO_TS.BUP or VTS_nn_0.BUP only when the IFO
+fails to parse. An IFO damaged after its header still parses, and its
+garbage is used. A disc's IFO and BUP are identical copies, so when they
+differ this reads both, once per title set and before the first open
+(ifoOpen, ifoOpenVMGI, ifoOpenVTSI), and uses the backup if it has fewer
+failed checks.
+
+--- a/src/dvdread_internal.h
++++ b/src/dvdread_internal.h
+@@ -54,6 +54,8 @@
+     /* Set 100 flags for BUP fallback, most signifiant left
+        [0] for upper remaining VTS, [1] for the first Main + 63 VTS */
+     uint64_t ifoBUPflags[2];
++  /* Title sets whose IFO was compared with its backup (bit per title). */
++  uint64_t ifoCheckedflags[2];
+ };
+ 
+ struct ifo_handle_private_s
+@@ -61,6 +63,8 @@
+     ifo_handle_t handle;
+     dvd_reader_t *ctx;
+     dvd_file_t *file;
++    /* CHECK_VALUE failures while reading this file: a damaged copy has some. */
++    int check_failures;
+ };
+ 
+ enum TagIdentifier {
+--- a/src/ifo_read.c
++++ b/src/ifo_read.c
+@@ -54,6 +54,7 @@
+ 
+ #define CHECK_VALUE(arg)\
+   if(!(arg)) {\
++    ifop->check_failures++;\
+     Log1(ifop->ctx, "CHECK_VALUE failed in %s:%i for %s",\
+                 __FILE__, __LINE__, # arg );\
+   }
+@@ -545,8 +546,65 @@
+     return bupflag;
+ }
+ 
++/* Reads a whole information file into memory; NULL if it cannot be read. */
++#define IFO_COMPARE_MAX (16 * 1024 * 1024)
++static uint8_t *ifoReadWhole(dvd_reader_t *ctx, int title, int backup, size_t *size) {
++  dvd_file_t *file = DVDOpenFile(ctx, title, backup ? DVD_READ_INFO_BACKUP_FILE
++                                                    : DVD_READ_INFO_FILE);
++  if(!file)
++    return NULL;
++  ssize_t blocks = DVDFileSize(file);
++  uint8_t *data = NULL;
++  if(blocks > 0 && (size_t)blocks * DVD_VIDEO_LB_LEN <= IFO_COMPARE_MAX) {
++    *size = (size_t)blocks * DVD_VIDEO_LB_LEN;
++    data = malloc(*size);
++    if(data && (DVDFileSeek(file, 0) != 0 || DVDReadBytes(file, data, *size) != (ssize_t)*size)) {
++      free(data);
++      data = NULL;
++    }
++  }
++  DVDCloseFile(file);
++  return data;
++}
++
++/* An information file and its backup are identical copies. When they differ
++   one of them is damaged: use the backup if it reads with fewer failed checks
++   than the information file, which libdvdread would otherwise accept as long as
++   its header still reads. */
++static int ifoPreferBackup(dvd_reader_t *ctx, int title) {
++  size_t ifo_size = 0, bup_size = 0;
++  uint8_t *ifo = ifoReadWhole(ctx, title, 0, &ifo_size);
++  uint8_t *bup = ifoReadWhole(ctx, title, 1, &bup_size);
++  int differ = ifo && bup && (ifo_size != bup_size || memcmp(ifo, bup, ifo_size) != 0);
++  free(ifo);
++  free(bup);
++  if(!differ)
++    return 0;
++  ifo_handle_t *a = ifoOpenFileOrBackup(ctx, title, 0);
++  ifo_handle_t *b = ifoOpenFileOrBackup(ctx, title, 1);
++  int prefer = b && (!a || PRIV(b)->check_failures < PRIV(a)->check_failures);
++  Log1(ctx, "%s for title %d differs from its backup; using the %s",
++       title ? "VTS IFO" : "VMG IFO", title, prefer ? "backup" : "IFO");
++  ifoClose(a);
++  ifoClose(b);
++  return prefer;
++}
++
++/* Compares a title set's IFO with its backup once, and marks the backup for
++   use when it is the intact copy. */
++static void ifoCheckBackup(dvd_reader_t *ctx, int title) {
++  uint64_t *checked = title > 63 ? &ctx->ifoCheckedflags[0] : &ctx->ifoCheckedflags[1];
++  uint64_t bit = UINT64_C(1) << (title > 63 ? title - 64 : title);
++  if((*checked & bit) || ifoGetBupFlag(ctx, title))
++    return;
++  *checked |= bit;
++  if(ifoPreferBackup(ctx, title))
++    ifoSetBupFlag(ctx, title);
++}
++
+ ifo_handle_t *ifoOpen(dvd_reader_t *ctx, int title) {
+   ifo_handle_t *ifofile;
++  ifoCheckBackup(ctx, title);
+   int bupflag = ifoGetBupFlag(ctx, title);
+ 
+   ifofile = ifoOpenFileOrBackup(ctx, title, bupflag);
+@@ -585,6 +643,8 @@
+       break;
+   }
+ 
++  if(ctx->dvd_type == DVD_V)
++    ifoCheckBackup(ctx, 0);
+   for(int backup = ifoGetBupFlag(ctx, 0); backup <= 1; backup++) 
+   {
+     ifop = calloc(1, sizeof(*ifop));
+@@ -624,6 +684,8 @@
+     return NULL;
+   }
+ 
++  if(ctx->dvd_type == DVD_V)
++    ifoCheckBackup(ctx, title);
+   for(int backup = ifoGetBupFlag(ctx, title); backup <= 1; backup++)
+   {
+     ifop = calloc(1, sizeof(*ifop));
