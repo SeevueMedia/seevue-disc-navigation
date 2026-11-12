@@ -16,7 +16,9 @@
  *     'O' open    u8 region (1 A, 2 B, 4 C), then "eng" style 3-letter audio,
  *                 menu and subtitle languages and a 2-letter country (11 bytes),
  *                 u8 parental age (255: no limit), u8 player flags (1 Ultra HD,
- *                 2 HDR display): the player the session's client is
+ *                 2 HDR display): the player the session's client is;
+ *                 optionally u8 open flags (1 direct: play the main title
+ *                 without the disc's menus, Java off)
  *     'N' next    u32 max_units: read up to max_units 6144-byte aligned units;
  *                 stops early at a playlist start, discontinuity, seek, still,
  *                 idle, end of title or error
@@ -28,6 +30,9 @@
  *     'S' subtitles u32 stream (1-based), u8 enable (0 hides them)
  *     'T' seek    i64 90 kHz time in the current playlist
  *     'V' angle   u8 angle (1-based; 0 the next one)
+ *     'P' play    u32 playlist: plays the disc-index title that plays it (an
+ *                 HDMV title whose movie object plays it, else a BD-J title
+ *                 that starts it or lists it); "no_title" when none does
  *     'G' graphics poll: hands over BD-J plane changes (also sent before every reply)
  *   BD-J runs only inside the sandbox (sandbox.h): JAVA_HOME is the Java runtime,
  *   BDNAVD_JAVA_OPTIONS the server's JVM options (heap and other caps),
@@ -110,7 +115,8 @@ static uint32_t uo_mask;
 /* An interactive menu shows, and the title has a pop-up menu. */
 static uint32_t menu_on, popup_available;
 /* Direct mode: the disc's menus cannot run (BD-J without a Java VM): the main
-   title plays without navigation, as players offer "play main title". */
+   title plays without navigation, as players offer "play main title". The
+   server also asks for it ('O' flag 1). */
 static int direct;
 
 /* ---------- framing ---------- */
@@ -887,6 +893,7 @@ static BD_DIR_H *folder_dir(void *handle, const char *rel_path) {
 static void cmd_open(const uint8_t *p, uint32_t len) {
   if (bd) { reply_error("already_open"); return; }
   if (len < 14) { reply_error("bad_open"); return; }
+  int want_direct = len >= 15 && (p[14] & 1);
   /* BD-J's cache and Java's temp directory are this worker's own, in its work
      directory ($TMPDIR, removed by the server when the session ends). The JVM
      mounts the disc's JARs under java.io.tmpdir in a directory named after the
@@ -929,9 +936,9 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
      nowhere, so a BD-J disc opens in direct mode. */
   const char *java = getenv("JAVA_HOME");
   bd_set_player_setting_str(bd, BLURAY_PLAYER_JAVA_HOME,
-                            java_allowed() && java && *java ? java : "/nonexistent/seevue-bdj-off");
+                            !want_direct && java_allowed() && java && *java ? java : "/nonexistent/seevue-bdj-off");
   const char *persistent = getenv("BDNAVD_PERSISTENT");
-  if (java_allowed() && persistent && *persistent)
+  if (!want_direct && java_allowed() && persistent && *persistent)
     bd_set_player_setting_str(bd, BLURAY_PLAYER_PERSISTENT_ROOT, persistent);
   else
     bd_set_player_setting(bd, BLURAY_PLAYER_SETTING_PERSISTENT_STORAGE, BLURAY_PERSISTENT_STORAGE_DISABLE);
@@ -957,7 +964,7 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
   /* Decode subtitles (PG); whether they show is the disc's (or the viewer's) choice. */
   bd_set_player_setting(bd, BLURAY_PLAYER_SETTING_DECODE_PG, 1);
   uint32_t titles = bd_get_titles(bd, TITLES_RELEVANT, 0);
-  direct = di->num_bdj_titles > 0 && !di->bdj_handled;
+  direct = want_direct || (di->num_bdj_titles > 0 && !di->bdj_handled);
   if (direct) {
     int main_title = bd_get_main_title(bd);
     if (main_title < 0 || !bd_select_title(bd, (uint32_t)main_title)) { reply_error("no_main_title"); return; }
@@ -1189,6 +1196,81 @@ static void cmd_angle(const uint8_t *p, uint32_t len) {
   j_end('R');
 }
 
+/* An HDMV movie object plays `playlist` (PlayPL, PlayPLatPI or PlayPLatMK with
+   an immediate playlist number). MovieObject.bdmv: header to byte 40, then
+   u32 length, u32 reserved, u16 objects; each object u16 flags, u16 commands,
+   then 12-byte commands. */
+static int mobj_plays(const uint8_t *b, int64_t size, uint32_t object, uint32_t playlist) {
+  if (size < 50) return 0;
+  uint32_t objects = (uint32_t)b[48] << 8 | b[49];
+  int64_t off = 50;
+  for (uint32_t o = 0; o < objects && off + 4 <= size; o++) {
+    uint32_t cmds = (uint32_t)b[off + 2] << 8 | b[off + 3];
+    off += 4;
+    if (off + (int64_t)cmds * 12 > size) return 0;
+    if (o == object)
+      for (uint32_t c = 0; c < cmds; c++) {
+        const uint8_t *k = b + off + (int64_t)c * 12;
+        int grp = (k[0] >> 3) & 3, sub = k[0] & 7, imm = k[1] >> 7, opt = k[1] & 15;
+        if (grp == 0 && sub == 2 && opt <= 2 && imm && be32(k + 4) == playlist) return 1;
+      }
+    off += (int64_t)cmds * 12;
+  }
+  return 0;
+}
+
+/* A BD-J object's accessible playlists name `playlist`: 2 when it starts it
+   (auto-start, listed first), 1 when it only lists it. */
+static int bdjo_plays(uint32_t object, uint32_t playlist) {
+  char path[32], name[6];
+  snprintf(path, sizeof path, "BDMV/BDJO/%05u.bdjo", object % 100000);
+  snprintf(name, sizeof name, "%05u", playlist % 100000);
+  void *data = NULL;
+  int64_t size = 0;
+  if (!bd_read_file(bd, path, &data, &size) || !data) return 0;
+  const uint8_t *b = data;
+  int found = 0;
+  uint64_t off = 48;
+  for (int block = 0; block < 2 && off + 4 <= (uint64_t)size; block++) off += 4 + (uint64_t)be32(b + off);
+  if (off + 8 <= (uint64_t)size) {
+    uint32_t word = be32(b + off + 4), count = word >> 21, autostart = (word >> 19) & 1;
+    for (uint32_t i = 0; i < count && off + 8 + (uint64_t)(i + 1) * 6 <= (uint64_t)size; i++)
+      if (!memcmp(b + off + 8 + (uint64_t)i * 6, name, 5)) { found = autostart && i == 0 ? 2 : 1; break; }
+  }
+  free(data);
+  return found;
+}
+
+/* 'P' play u32 playlist: the disc-index title that plays it, in menus mode. */
+static void cmd_play(const uint8_t *p, uint32_t len) {
+  if (!bd) { reply_error("not_open"); return; }
+  if (len < 4) { reply_error("bad_play"); return; }
+  if (direct) { reply_error("refused"); return; }
+  uint32_t playlist = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+  const BLURAY_DISC_INFO *di = bd_get_disc_info(bd);
+  void *mobj = NULL;
+  int64_t mobj_size = 0;
+  if (!bd_read_file(bd, "BDMV/MovieObject.bdmv", &mobj, &mobj_size)) mobj = NULL;
+  uint32_t title = 0;
+  int best = 0;
+  for (uint32_t t = 1; di && t <= di->num_titles && best < 3; t++) {
+    const BLURAY_TITLE *ti = di->titles[t];
+    if (!ti) continue;
+    int score = ti->bdj ? bdjo_plays(ti->id_ref, playlist)
+                        : mobj && mobj_plays(mobj, mobj_size, ti->id_ref, playlist) ? 3 : 0;
+    if (score > best) { best = score; title = t; }
+  }
+  free(mobj);
+  if (!best) { reply_error("no_title"); return; }
+  int ok = bd_play_title(bd, title);
+  drain_events();
+  j_begin();
+  j("\"ok\":%s,\"title_played\":%u,", ok ? "true" : "false", title);
+  if (!ok) j("\"error\":\"%s\",", refusal(BLURAY_UO_TITLE_SEARCH));
+  j_position();
+  j_end('R');
+}
+
 int main(void) {
   static uint8_t payload[1100];
   proto_out = dup(STDOUT_FILENO);
@@ -1234,6 +1316,7 @@ int main(void) {
       case 'A': case 'S': cmd_stream((char)head[4], payload, len); break;
       case 'T': cmd_seek(payload, len); break;
       case 'V': cmd_angle(payload, len); break;
+      case 'P': cmd_play(payload, len); break;
       case 'G': /* poll: BD-J graphics drawn since the last reply (sent before every reply) */
         if (!bd) { reply_error("not_open"); break; }
         bdj_watch();
