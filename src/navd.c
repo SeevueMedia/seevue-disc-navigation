@@ -29,7 +29,8 @@
  *     'J' seek    u64 90 kHz time in the current program chain
  *     'V' angle   u8 angle (1-based; 0 the next one)
  *   Commands the disc forbids here (its user-operation masks) are refused with
- *   "uop_prohibited".
+ *   "uop_prohibited". A read that reaches CSS-scrambled sectors (an encrypted
+ *   disc) is refused with "encrypted".
  *   Replies (navd -> server)
  *     'D' data    n * 2048-byte sectors, in delivery order
  *     'E' event   one JSON object
@@ -403,6 +404,18 @@ static void event_nav(const pci_t *pci, const dsi_t *dsi, uint32_t id) {
   j_end('E');
 }
 
+/* A sector still CSS-scrambled: its PES header's scrambling control bits are
+   set (descrambling clears them). Decrypted discs play; this one cannot. */
+static int scrambled(const uint8_t *s) {
+  if (s[0] != 0 || s[1] != 0 || s[2] != 1 || s[3] != 0xBA) return 0;
+  size_t pes = 14 + (s[13] & 7);
+  if (pes + 7 > SECTOR) return 0;
+  const uint8_t *p = s + pes;
+  int id = p[3];
+  int media = id == 0xE0 || id == 0xBD || (id & 0xE0) == 0xC0;
+  return p[0] == 0 && p[1] == 0 && p[2] == 1 && media && (p[6] & 0xC0) == 0x80 && (p[6] & 0x30) != 0;
+}
+
 /* ---------- commands ---------- */
 
 static void cmd_open(const uint8_t *p, uint32_t len) {
@@ -482,6 +495,12 @@ static void cmd_next(const uint8_t *p, uint32_t len) {
     }
     switch (event) {
       case DVDNAV_BLOCK_OK:
+        if (scrambled(block)) {
+          /* Nothing scrambled is delivered. */
+          batch_n = 0;
+          reply_error("encrypted");
+          return;
+        }
         memcpy(batch + batch_n * SECTOR, block, SECTOR);
         batch_n++;
         delivered++;
