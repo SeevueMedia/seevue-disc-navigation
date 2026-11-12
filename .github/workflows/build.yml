@@ -40,6 +40,8 @@ jobs:
           PATH="$RUNNER_TEMP/buildtools/bin:$PATH" ./build.sh --clean
       - name: Smoke test
         run: ci/smoke.sh dist "${{ matrix.platform }}"
+      - name: Sandbox boundary probe
+        run: ci/sandbox-test.sh
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}
