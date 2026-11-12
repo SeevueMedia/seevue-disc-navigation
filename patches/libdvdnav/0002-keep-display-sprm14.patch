@@ -1,0 +1,22 @@
+libdvdnav: keep SPRM 14 as the player set it.
+
+SPRM 14 is the player's display configuration (its aspect and output
+mode), which a disc's commands read to choose menus and pictures.
+vm_get_video_aspect() overwrote its aspect bits with the content's aspect
+on every call, so a player on a 4:3 display claimed 16:9 as soon as a
+16:9 title was asked about. It now only returns the content's aspect.
+
+--- a/src/vm/vmget.c
++++ b/src/vm/vmget.c
+@@ -300,9 +300,8 @@
+     return -1;
+   }
+ 
+-  (vm->state).registers.SPRM[14] &= ~(0x3 << 10);
+-  (vm->state).registers.SPRM[14] |= aspect << 10;
+-
++  /* SPRM 14 is the player's display, which discs read; the content's aspect
++     is returned, not written there. */
+   return aspect;
+ }
+ 

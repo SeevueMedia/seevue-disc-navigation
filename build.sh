@@ -164,12 +164,17 @@ if ! stamp bluray; then
   done_ bluray
 fi
 if ! stamp dvdread; then
-  meson_build dvdread "$(unpack libdvdread)" -Ddefault_library=static -Dlibdvdcss=disabled -Denable_docs=false
+  d="$(unpack libdvdread)"
+  # An information file whose backup differs: use the backup when it is the intact copy.
+  for pt in "$ROOT"/patches/libdvdread/*.patch; do
+    patch -s -p1 -N -d "$d" < "$pt"
+  done
+  meson_build dvdread "$d" -Ddefault_library=static -Dlibdvdcss=disabled -Denable_docs=false
   done_ dvdread
 fi
 if ! stamp dvdnav; then
   d="$(unpack libdvdnav)"
-  # dvdnav_open_files: disc folders through the read service (navd).
+  # dvdnav_open_files: disc folders through the read service (navd); SPRM 14 kept as navd sets it.
   for pt in "$ROOT"/patches/libdvdnav/*.patch; do
     patch -s -p1 -N -d "$d" < "$pt"
   done

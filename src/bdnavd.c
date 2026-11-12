@@ -14,16 +14,20 @@
  *
  *   Commands (server -> bdnavd)
  *     'O' open    u8 region (1 A, 2 B, 4 C), then "eng" style 3-letter audio,
- *                 menu and subtitle languages and a 2-letter country (11 bytes)
+ *                 menu and subtitle languages and a 2-letter country (11 bytes),
+ *                 u8 parental age (255: no limit), u8 player flags (1 Ultra HD,
+ *                 2 HDR display): the player the session's client is
  *     'N' next    u32 max_units: read up to max_units 6144-byte aligned units;
  *                 stops early at a playlist start, discontinuity, seek, still,
  *                 idle, end of title or error
- *     'K' key     u32 libbluray key code, i64 pts (90 kHz, -1 unknown)
+ *     'K' key     u32 libbluray key code (arrows, OK, menus, 0-9, colour keys),
+ *                 i64 pts (90 kHz, -1 unknown)
  *     'M' menu    i64 pts: top menu call
  *     'C' chapter u32 chapter (0-based) in the current playlist
  *     'A' audio   u32 stream (1-based, the play item's STN order)
  *     'S' subtitles u32 stream (1-based), u8 enable (0 hides them)
  *     'T' seek    i64 90 kHz time in the current playlist
+ *     'V' angle   u8 angle (1-based; 0 the next one)
  *     'G' graphics poll: hands over BD-J plane changes (also sent before every reply)
  *   BD-J needs JAVA_HOME and LIBBLURAY_CP; BDNAVD_STORAGE holds its persistent
  *   and cache data.
@@ -31,6 +35,8 @@
  *   title plays without the disc's menus (keys other than chapters, audio and
  *   subtitles are refused).
  *     'X' quit
+ *   A command the disc forbids here (its user-operation mask) is refused with
+ *   "uop_prohibited".
  *   Replies (bdnavd -> server)
  *     'D' data    whole 192-byte source packets (aligned 6144-byte units, except
  *                 where libbluray returns a short read at a clip's end)
@@ -62,6 +68,7 @@
 #include <libbluray/overlay.h>
 #include <libbluray/player_settings.h>
 #include <libbluray/filesystem.h>
+#include <libbluray/log_control.h>
 #include "bdcaps.h"
 #include "readsvc.h"
 
@@ -91,6 +98,10 @@ static uint32_t *plane[2];
 static int bbox[2][4];
 static int cleared[2];
 static uint32_t cur_playlist = 0xffffffff, cur_audio = 0, cur_pg = 0, pg_on = 0;
+/* The disc's current user-operation mask (BLURAY_UO_*), from its events. */
+static uint32_t uo_mask;
+/* An interactive menu shows, and the title has a pop-up menu. */
+static uint32_t menu_on, popup_available;
 /* Direct mode: the disc's menus cannot run (BD-J without a Java VM): the main
    title plays without navigation, as players offer "play main title". */
 static int direct;
@@ -141,9 +152,9 @@ static void frame(char type, const void *payload, uint32_t len) {
 #ifndef SEEVUE_WORKER_VERSION
 #define SEEVUE_WORKER_VERSION "dev"
 #endif
-/* Protocol v1: the hello, once, before any command is read. */
+/* The hello, once, before any command is read. */
 static void send_hello(void) {
-  static const char hello[] = "{\"protocol\":2,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
+  static const char hello[] = "{\"protocol\":3,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
   frame('H', hello, (uint32_t)(sizeof hello - 1));
 }
 
@@ -187,9 +198,22 @@ static void j_begin(void) {
 
 static void argb_send_pending(void);
 
+static void damage_report(void);
+
 static void j_end(char type) {
-  /* BD-J draws from Java threads: hand over its plane changes before each reply. */
-  if (type == 'R') argb_send_pending();
+  /* BD-J draws from Java threads: hand over its plane changes before each reply,
+     and any damage libbluray logged. */
+  if (type == 'R') {
+    char saved[JSON_MAX];
+    size_t saved_len = json_len;
+    int saved_overflow = json_overflow;
+    memcpy(saved, json, json_len);
+    argb_send_pending();
+    damage_report();
+    memcpy(json, saved, saved_len);
+    json_len = saved_len;
+    json_overflow = saved_overflow;
+  }
   if (json_overflow) {
     j_begin();
     j("\"ok\":false,\"error\":\"json_overflow\"");
@@ -214,6 +238,8 @@ static void flush_batch(void) {
 static void j_position(void) {
   j("\"title\":%u,\"playlist\":%d,\"chapter\":%u,\"time_90k\":%" PRIu64 ",\"audio_sel\":%u,\"pg_sel\":%u,\"pg_on\":%u", bd_get_current_title(bd),
     cur_playlist == 0xffffffff ? -1 : (int)cur_playlist, bd_get_current_chapter(bd), bd_tell_time(bd), cur_audio, cur_pg, pg_on);
+  j(",\"angle\":%u,\"uo_mask\":%u,\"menu\":%u,\"popup\":%u", bd_get_current_angle(bd) + 1, uo_mask, menu_on,
+    popup_available);
 }
 
 /* ---------- overlays ---------- */
@@ -387,6 +413,56 @@ static void *log_relay(void *arg) {
   return NULL;
 }
 
+/* Damage libbluray works around or only logs (an unreadable playlist, clip or
+   clip info, a damaged index): it plays on or stays in the menu, and the viewer
+   would never be told. Its log handler marks each kind once; the next reply
+   carries a "damaged" event. */
+enum { DAMAGE_PLAYLIST = 1, DAMAGE_CLIP = 2, DAMAGE_INDEX = 4 };
+static atomic_int damage_seen, damage_reported;
+static pthread_mutex_t damage_lock = PTHREAD_MUTEX_INITIALIZER;
+static char damage_detail[3][128];
+
+static void damage_note(int kind, int slot, const char *msg) {
+  pthread_mutex_lock(&damage_lock);
+  if (!damage_detail[slot][0]) {
+    size_t k = 0;
+    for (const char *c = msg; *c && *c != '\n' && k + 1 < sizeof damage_detail[slot]; c++)
+      if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) damage_detail[slot][k++] = *c;
+    damage_detail[slot][k] = 0;
+  }
+  pthread_mutex_unlock(&damage_lock);
+  atomic_fetch_or(&damage_seen, kind);
+}
+
+static void bd_log(const char *msg) {
+  if (!msg) return;
+  fputs(msg, stderr);
+  /* Only what libbluray logs once its backups failed too: a playlist read from
+     BACKUP plays and is not reported. */
+  if (strstr(msg, "Unable to open title"))
+    damage_note(DAMAGE_PLAYLIST, 0, msg);
+  else if (strstr(msg, "Unable to open clip") || (strstr(msg, "Clip ") && strstr(msg, " empty!")))
+    damage_note(DAMAGE_CLIP, 1, msg);
+  else if (strstr(msg, "No disc index") || strstr(msg, "Possible incomplete BluRay image"))
+    damage_note(DAMAGE_INDEX, 2, msg);
+}
+
+static void damage_report(void) {
+  int fresh = atomic_load(&damage_seen) & ~atomic_load(&damage_reported);
+  static const char *what[3] = {"playlist", "clip", "index"};
+  for (int i = 0; i < 3; i++) {
+    if (!(fresh & (1 << i))) continue;
+    atomic_fetch_or(&damage_reported, 1 << i);
+    char detail[128];
+    pthread_mutex_lock(&damage_lock);
+    memcpy(detail, damage_detail[i], sizeof detail);
+    pthread_mutex_unlock(&damage_lock);
+    j_begin();
+    j("\"ev\":\"damaged\",\"what\":\"%s\",\"detail\":\"%s\"", what[i], detail);
+    j_end('E');
+  }
+}
+
 static uint64_t mono_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -531,9 +607,10 @@ static void j_streams(uint32_t item) {
     return;
   }
   BLURAY_CLIP_INFO *c = &ti->clips[item];
-  j(",\"clip\":\"%s\",\"video\":[", c->clip_id);
+  j(",\"clip\":\"%s\",\"angles\":%u,\"video\":[", c->clip_id, ti->angle_count ? ti->angle_count : 1);
   for (int i = 0; i < c->video_stream_count; i++)
-    j("%s{\"pid\":%u,\"coding\":%u}", i ? "," : "", c->video_streams[i].pid, c->video_streams[i].coding_type);
+    j("%s{\"pid\":%u,\"coding\":%u,\"format\":%u,\"aspect\":%u}", i ? "," : "", c->video_streams[i].pid,
+      c->video_streams[i].coding_type, c->video_streams[i].format, c->video_streams[i].aspect);
   j("],\"audio\":[");
   for (int i = 0; i < c->audio_stream_count; i++)
     j("%s{\"pid\":%u,\"coding\":%u,\"lang\":\"%.3s\"}", i ? "," : "", c->audio_streams[i].pid,
@@ -566,6 +643,9 @@ static const char *event(const BD_EVENT *ev) {
     case BD_EVENT_AUDIO_STREAM: cur_audio = ev->param; break;
     case BD_EVENT_PG_TEXTST_STREAM: cur_pg = ev->param; break;
     case BD_EVENT_PG_TEXTST: pg_on = ev->param; break;
+    case BD_EVENT_UO_MASK_CHANGED: uo_mask = ev->param; break;
+    case BD_EVENT_MENU: menu_on = ev->param; break;
+    case BD_EVENT_POPUP: popup_available = ev->param; break;
     default: break;
   }
   flush_batch();
@@ -575,7 +655,8 @@ static const char *event(const BD_EVENT *ev) {
   if (ev->event == BD_EVENT_PLAYITEM) j_streams(ev->param);
   j_end('E');
   switch (ev->event) {
-    case BD_EVENT_ERROR: return "error";
+    /* libbluray could not run the title: a Java title is a BD-J failure. */
+    case BD_EVENT_ERROR: return ev->param == BD_ERROR_BDJ ? "bdj_error" : "error";
     case BD_EVENT_ENCRYPTED: return "encrypted";
     case BD_EVENT_PLAYLIST: return "playlist";
     case BD_EVENT_DISCONTINUITY: return "discontinuity";
@@ -591,29 +672,32 @@ static const char *event(const BD_EVENT *ev) {
 /* Called on every read and graphics poll. */
 /* stage "restart" (a failed start, restarted from the disc's menu) is reported every
    time; "load" and "start" (restarts used up) once. */
-static void bdj_report(const char *stage) {
+/* "reason": "start" (an application failed to start), "load" (it could not
+   be loaded) or "title" (libbluray could not run the Java title). */
+static void bdj_report(const char *stage, const char *reason) {
   if (strcmp(stage, "restart")) {
     if (bdj_reported) return;
     bdj_reported = 1;
   }
   j_begin();
-  j("\"ev\":\"bdj_failed\",\"stage\":\"%s\",\"detail\":\"%s\"", stage, bdj_fail_line);
+  j("\"ev\":\"bdj_failed\",\"stage\":\"%s\",\"reason\":\"%s\",\"detail\":\"%s\"", stage, reason,
+    bdj_fail_line);
   j_end('E');
 }
 
 static void bdj_watch(void) {
   if (atomic_exchange(&bdj_load_failed, 0)) {
     fprintf(stderr, "bdnavd: BD-J application failed to load (no restart)\n");
-    bdj_report("load");
+    bdj_report("load", "load");
     return;
   }
   int start_failed = atomic_exchange(&bdj_start_failed, 0);
-  if (start_failed && bdj_fail_retries >= BDJ_FAIL_RETRIES) { bdj_report("start"); return; }
+  if (start_failed && bdj_fail_retries >= BDJ_FAIL_RETRIES) { bdj_report("start", "start"); return; }
   if (start_failed && bdj_fail_retries < BDJ_FAIL_RETRIES) {
     bdj_fail_retries++;
     fprintf(stderr, "bdnavd: BD-J application failed to start; menu call to restart it (%d/%d)\n",
             bdj_fail_retries, BDJ_FAIL_RETRIES);
-    bdj_report("restart");
+    bdj_report("restart", "start");
     bd_menu_call(bd, -1);
     return;
   }
@@ -741,7 +825,7 @@ static BD_DIR_H *folder_dir(void *handle, const char *rel_path) {
 
 static void cmd_open(const uint8_t *p, uint32_t len) {
   if (bd) { reply_error("already_open"); return; }
-  if (len < 12) { reply_error("bad_open"); return; }
+  if (len < 14) { reply_error("bad_open"); return; }
   /* The JVM mounts the disc's JARs under java.io.tmpdir in a directory named
      after the disc, shared by every process: an ending session's clean-up
      removed a starting session's mount (BD-J start-up "io exception").
@@ -781,7 +865,7 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
   memcpy(lang, p + 4, 3); bd_set_player_setting_str(bd, BLURAY_PLAYER_SETTING_MENU_LANG, lang);
   memcpy(lang, p + 7, 3); bd_set_player_setting_str(bd, BLURAY_PLAYER_SETTING_PG_LANG, lang);
   memcpy(country, p + 10, 2); bd_set_player_setting_str(bd, BLURAY_PLAYER_SETTING_COUNTRY_CODE, country);
-  bd_apply_player_caps(bd);
+  bd_apply_player_caps(bd, p[12], p[13]);
   bd_register_overlay_proc(bd, NULL, overlay);
   argb.lock = argb_lock_cb;
   argb.unlock = argb_unlock_cb;
@@ -902,15 +986,54 @@ static int64_t get_i64(const uint8_t *p) {
   return (int64_t)v;
 }
 
+/* The user operation a key or command needs (BLURAY_UO_*), 0 for none. */
+static uint32_t key_uo(uint32_t key) {
+  switch (key) {
+    case BD_VK_ROOT_MENU: return BLURAY_UO_MENU_CALL;
+    case BD_VK_POPUP: return menu_on ? BLURAY_UO_POPUP_OFF_MASK : BLURAY_UO_POPUP_ON_MASK;
+    case BD_VK_UP: return BLURAY_UO_MOVE_UP_SELECTED_BUTTON_MASK;
+    case BD_VK_DOWN: return BLURAY_UO_MOVE_DOWN_SELECTED_BUTTON_MASK;
+    case BD_VK_LEFT: return BLURAY_UO_MOVE_LEFT_SELECTED_BUTTON_MASK;
+    case BD_VK_RIGHT: return BLURAY_UO_MOVE_RIGHT_SELECTED_BUTTON_MASK;
+    case BD_VK_ENTER: return BLURAY_UO_ACTIVATE_BUTTON_MASK;
+    default: return key <= BD_VK_9 ? BLURAY_UO_SELECT_AND_ACTIVATE_MASK : 0;
+  }
+}
+
+/* The current title is a Java one (its keys go to the application). */
+static int current_title_is_bdj(void) {
+  const BLURAY_DISC_INFO *di = bd_get_disc_info(bd);
+  uint32_t t = bd_get_current_title(bd);
+  if (!di) return 0;
+  const BLURAY_TITLE *title = t == 0xffff ? di->first_play : t == 0 ? di->top_menu
+                            : t <= di->num_titles ? di->titles[t] : NULL;
+  return title && title->bdj;
+}
+
+/* Why a command was refused: the disc's mask, or libbluray's own reasons. */
+static const char *refusal(uint32_t uo) { return (uo_mask & uo) ? "uop_prohibited" : "refused"; }
+
 static void cmd_key(const uint8_t *p, uint32_t len) {
   if (!bd) { reply_error("not_open"); return; }
   if (len < 12) { reply_error("bad_key"); return; }
   uint32_t key = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+  uint32_t uo = key_uo(key);
+  /* libbluray drops a key an HDMV title's mask forbids and answers 0, as for
+     a key that did nothing: refuse it here, by the disc's current mask. */
+  if ((uo_mask & uo) && !current_title_is_bdj()) {
+    j_begin();
+    j("\"ok\":false,\"result\":0,\"error\":\"uop_prohibited\",");
+    j_position();
+    j_end('R');
+    return;
+  }
   int r = bd_user_input(bd, get_i64(p + 4), key);
   drain_events();
+  /* The root menu key is a menu call: 1 when it ran, 0 when refused. */
+  int refused = key == BD_VK_ROOT_MENU ? r <= 0 : r < 0;
   j_begin();
-  j("\"ok\":%s,\"result\":%d,", r < 0 ? "false" : "true", r);
-  if (r < 0) j("\"error\":\"refused\",");
+  j("\"ok\":%s,\"result\":%d,", refused ? "false" : "true", r);
+  if (refused) j("\"error\":\"%s\",", refusal(uo));
   j_position();
   j_end('R');
 }
@@ -921,7 +1044,7 @@ static void cmd_menu(const uint8_t *p, uint32_t len) {
   drain_events();
   j_begin();
   j("\"ok\":%s,", r ? "true" : "false");
-  if (!r) j("\"error\":\"refused\",");
+  if (!r) j("\"error\":\"%s\",", refusal(BLURAY_UO_MENU_CALL));
   j_position();
   j_end('R');
 }
@@ -934,7 +1057,9 @@ static void cmd_chapter(const uint8_t *p, uint32_t len) {
   drain_events();
   j_begin();
   j("\"ok\":%s,\"pos\":%" PRId64 ",", r < 0 ? "false" : "true", r);
-  if (r < 0) j("\"error\":\"refused\",");
+  if (r < 0)
+    j("\"error\":\"%s\",", refusal(BLURAY_UO_CHAPTER_SEARCH | BLURAY_UO_SKIP_TO_NEXT_POINT_MASK |
+                                    BLURAY_UO_SKIP_BACK_TO_PREVIOUS_POINT_MASK));
   j_position();
   j_end('R');
 }
@@ -953,7 +1078,10 @@ static void cmd_stream(char c, const uint8_t *p, uint32_t len) {
   drain_events();
   j_begin();
   j("\"ok\":%s,", ok ? "true" : "false");
-  if (!ok) j("\"error\":\"refused\",");
+  if (!ok)
+    j("\"error\":\"%s\",", refusal(c == 'A' ? BLURAY_UO_PRIMARY_AUDIO_CHANGE_MASK
+                                           : BLURAY_UO_PG_TEXTST_CHANGE_MASK |
+                                                 BLURAY_UO_PG_TEXTST_ENABLE_DISABLE_MASK));
   j_position();
   j_end('R');
 }
@@ -966,7 +1094,26 @@ static void cmd_seek(const uint8_t *p, uint32_t len) {
   drain_events();
   j_begin();
   j("\"ok\":%s,\"pos\":%" PRId64 ",", r < 0 ? "false" : "true", r);
-  if (r < 0) j("\"error\":\"refused\",");
+  if (r < 0) j("\"error\":\"%s\",", refusal(BLURAY_UO_TIME_SEARCH_MASK));
+  j_position();
+  j_end('R');
+}
+
+/* 'V' angle u8: 1-based, 0 the next one. */
+static void cmd_angle(const uint8_t *p, uint32_t len) {
+  if (!bd) { reply_error("not_open"); return; }
+  if (len < 1) { reply_error("bad_angle"); return; }
+  BLURAY_TITLE_INFO *ti = cur_playlist == 0xffffffff ? NULL : bd_get_playlist_info(bd, cur_playlist, 0);
+  unsigned count = ti ? ti->angle_count : 0;
+  if (ti) bd_free_title_info(ti);
+  if (count <= 1) { reply_error("no_angles"); return; }
+  unsigned want = p[0] ? (unsigned)p[0] - 1 : (bd_get_current_angle(bd) + 1) % count;
+  if (want >= count) { reply_error("no_angles"); return; }
+  int ok = bd_select_angle(bd, want);
+  drain_events();
+  j_begin();
+  j("\"ok\":%s,\"angles\":%u,", ok ? "true" : "false", count);
+  if (!ok) j("\"error\":\"%s\",", refusal(BLURAY_UO_ANGLE_CHANGE_MASK));
   j_position();
   j_end('R');
 }
@@ -991,6 +1138,8 @@ int main(void) {
   } else {
     fprintf(stderr, "bdnavd: log relay unavailable; start failures are found by the drawing watchdog only\n");
   }
+  /* libbluray's log, through bd_log: to stderr, and damage it only logs becomes an event. */
+  bd_set_debug_handler(bd_log);
   send_hello();
   for (;;) {
     uint8_t head[5];
@@ -1010,6 +1159,7 @@ int main(void) {
       case 'C': cmd_chapter(payload, len); break;
       case 'A': case 'S': cmd_stream((char)head[4], payload, len); break;
       case 'T': cmd_seek(payload, len); break;
+      case 'V': cmd_angle(payload, len); break;
       case 'G': /* poll: BD-J graphics drawn since the last reply (sent before every reply) */
         if (!bd) { reply_error("not_open"); break; }
         bdj_watch();
