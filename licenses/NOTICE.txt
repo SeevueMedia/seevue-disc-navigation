@@ -15,7 +15,9 @@ bdnavd Blu-ray navigation. Dynamically linked with libbluray 1.5.0 and
        the GPL, version 2 or later.
 
 libbluray carries two patches (licenses/patches/libbluray/): serialised
-libudfread calls and the IG animation frame interval. Its BD-J classes
+libudfread calls and the IG animation frame interval. libdvdnav carries one
+(licenses/patches/libdvdnav/): dvdnav_open_files, which opens a disc folder
+through libdvdread's file-system callbacks. Its BD-J classes
 (lib/libbluray-*.jar) are LGPL-2.1-or-later.
 
 Built into the libbluray shared library:

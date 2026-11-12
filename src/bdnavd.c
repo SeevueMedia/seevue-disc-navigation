@@ -2,8 +2,10 @@
  * bdnavd: Blu-ray navigation worker (libbluray, HDMV and BD-J menus).
  *
  * Runs libbluray's navigation over a decrypted Blu-ray image for one viewing
- * session, under a supervising server. The image arrives as an open
- * file descriptor (fd 3) and is opened through /dev/fd/3.
+ * session, under a supervising server. This process never opens the disc
+ * itself: it reads it through the server's read service (readsvc.h, fds 3
+ * and 4). An image is read by block (bd_open_stream); a disc folder (BDMV
+ * inside) file by file (bd_open_files).
  *
  * Licence: GPL-2.0-or-later; links libbluray and libudfread (LGPL-2.1-or-later).
  *
@@ -23,8 +25,8 @@
  *     'S' subtitles u32 stream (1-based), u8 enable (0 hides them)
  *     'T' seek    i64 90 kHz time in the current playlist
  *     'G' graphics poll: hands over BD-J plane changes (also sent before every reply)
- *   'O' may carry a disc folder's path after its 12 bytes of settings. BD-J needs
- *   JAVA_HOME and LIBBLURAY_CP; BDNAVD_STORAGE holds its persistent and cache data.
+ *   BD-J needs JAVA_HOME and LIBBLURAY_CP; BDNAVD_STORAGE holds its persistent
+ *   and cache data.
  *   Discs with BD-J titles and no usable Java VM open in direct mode: the main
  *   title plays without the disc's menus (keys other than chapters, audio and
  *   subtitles are refused).
@@ -59,7 +61,9 @@
 #include <libbluray/keys.h>
 #include <libbluray/overlay.h>
 #include <libbluray/player_settings.h>
+#include <libbluray/filesystem.h>
 #include "bdcaps.h"
+#include "readsvc.h"
 
 #define UNIT 6144
 #define MAX_UNITS 64           /* per 'N' command and per 'D' frame */
@@ -139,7 +143,7 @@ static void frame(char type, const void *payload, uint32_t len) {
 #endif
 /* Protocol v1: the hello, once, before any command is read. */
 static void send_hello(void) {
-  static const char hello[] = "{\"protocol\":1,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
+  static const char hello[] = "{\"protocol\":2,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
   frame('H', hello, (uint32_t)(sizeof hello - 1));
 }
 
@@ -633,22 +637,111 @@ static void drain_events(void) {
   while (bd_get_event(bd, &ev)) event(&ev);
 }
 
+/* ---------- the disc, through the read service ---------- */
+
+#define BLOCK 2048
+static uint64_t image_size;
+
+/* libudfread's block input: num_blocks at lba, fewer at the image's end. */
+static int image_blocks(void *handle, void *buf, int lba, int num_blocks) {
+  (void)handle;
+  if (lba < 0 || num_blocks <= 0) return 0;
+  uint64_t off = (uint64_t)lba * BLOCK, want = (uint64_t)num_blocks * BLOCK, done = 0;
+  while (done < want) {
+    int64_t r = rs_read(off + done, (uint8_t *)buf + done, (size_t)(want - done));
+    if (r < 0) return done ? (int)(done / BLOCK) : -1;
+    if (r == 0) break;
+    done += (uint64_t)r;
+  }
+  return (int)(done / BLOCK);
+}
+
+static void file_close(BD_FILE_H *file) {
+  rs_close(file->internal);
+  free(file->internal);
+  free(file);
+}
+
+static int64_t file_seek(BD_FILE_H *file, int64_t offset, int32_t origin) {
+  rs_file *f = file->internal;
+  if (origin != SEEK_SET && origin != SEEK_CUR && origin != SEEK_END) return -1;
+  int64_t base = origin == SEEK_CUR ? (int64_t)f->pos : origin == SEEK_END ? (int64_t)f->size : 0;
+  if (base + offset < 0) return -1;
+  f->pos = (uint64_t)(base + offset);
+  return (int64_t)f->pos;
+}
+
+static int64_t file_tell(BD_FILE_H *file) { return (int64_t)((rs_file *)file->internal)->pos; }
+
+static int64_t file_read(BD_FILE_H *file, uint8_t *buf, int64_t size) {
+  if (size <= 0) return 0;
+  int64_t done = 0;
+  while (done < size) {
+    int64_t r = rs_fread(file->internal, buf + done, (size_t)(size - done));
+    if (r < 0) return done ? done : -1;
+    if (r == 0) break;
+    done += r;
+  }
+  return done;
+}
+
+static int64_t file_write(BD_FILE_H *file, const uint8_t *buf, int64_t size) {
+  (void)file; (void)buf; (void)size;
+  return -1; /* the disc is read-only */
+}
+
+/* libbluray asks with paths relative to the disc root ("BDMV/index.bdmv"). */
+static BD_FILE_H *folder_file(void *handle, const char *rel_path) {
+  (void)handle;
+  char rel[RS_MAX_PATH + 1];
+  BD_FILE_H *file = calloc(1, sizeof *file);
+  rs_file *f = calloc(1, sizeof *f);
+  if (!file || !f || rs_relative("", rel_path, rel, sizeof rel) < 0 || rs_open(rel, f) != RS_OK) {
+    free(file);
+    free(f);
+    return NULL;
+  }
+  file->internal = f;
+  file->close = file_close;
+  file->seek = file_seek;
+  file->tell = file_tell;
+  file->read = file_read;
+  file->write = file_write;
+  return file;
+}
+
+static void dir_close(BD_DIR_H *dir) {
+  rs_list_free(dir->internal);
+  free(dir->internal);
+  free(dir);
+}
+
+static int dir_read(BD_DIR_H *dir, BD_DIRENT *entry) {
+  return rs_list_next(dir->internal, entry->d_name, sizeof entry->d_name);
+}
+
+static BD_DIR_H *folder_dir(void *handle, const char *rel_path) {
+  (void)handle;
+  char rel[RS_MAX_PATH + 1];
+  BD_DIR_H *dir = calloc(1, sizeof *dir);
+  rs_list *list = calloc(1, sizeof *list);
+  if (!dir || !list || rs_relative("", rel_path, rel, sizeof rel) < 0 ||
+      rs_list_open(rel, list) != RS_OK) {
+    free(dir);
+    free(list);
+    return NULL;
+  }
+  dir->internal = list;
+  dir->close = dir_close;
+  dir->read = dir_read;
+  return dir;
+}
+
 /* ---------- commands ---------- */
 
 static void cmd_open(const uint8_t *p, uint32_t len) {
   if (bd) { reply_error("already_open"); return; }
   if (len < 12) { reply_error("bad_open"); return; }
-  /* A disc folder (BDMV inside) comes as a path after the settings; an image as fd 3. */
-  /* libbluray opens the image more than once (BD-J's file access has its own),
-     and makes each seek + read atomic per opening only. /dev/fd/3 on macOS
-     duplicates the descriptor, so all openings would share one file position
-     and race (BD-J start-up failed with an I/O error): reopen by the file's own
-     path instead. Linux's /proc/self/fd/3 already gives an independent opening. */
-  char path[PATH_MAX > 1024 ? PATH_MAX : 1024] = "/proc/self/fd/3";
-#ifdef F_GETPATH
-  if (fcntl(3, F_GETPATH, path) == -1) snprintf(path, sizeof path, "/dev/fd/3");
-#endif
-  if (len > 12 && len - 12 < sizeof path) { memcpy(path, p + 12, len - 12); path[len - 12] = 0; }
   /* The JVM mounts the disc's JARs under java.io.tmpdir in a directory named
      after the disc, shared by every process: an ending session's clean-up
      removed a starting session's mount (BD-J start-up "io exception").
@@ -656,9 +749,10 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
   /* Java 18+ ignores a security manager unless the JVM allows one. libbluray
      installs its own anyway (a reflection workaround), but the JDK then skips
      its file checks, and those checks are what copy disc files into
-     libbluray's cache on demand when the disc is an image: BD-J menus that
-     read the disc's playlists or images themselves (Interstellar UHD) got
-     "file not found" and drew nothing. */
+     libbluray's cache on demand when the disc has no mount point (an image,
+     or the read service's blocks or files, as here): BD-J menus that read the
+     disc's playlists or images themselves got "file not found" and drew
+     nothing. */
   char opt[1200] = "-Djava.security.manager=allow";
   const char *store = getenv("BDNAVD_STORAGE");
   if (store && *store) {
@@ -670,8 +764,13 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
       snprintf(opt, sizeof opt, "-Djava.security.manager=allow -Djava.io.tmpdir=%s", own_tmp);
   }
   setenv("JAVA_TOOL_OPTIONS", opt, 1);
-  bd = bd_open(path, NULL);
+  int layout = 0;
+  if (rs_info(&layout, &image_size) != 0) { reply_error("no_disc"); return; }
+  bd = bd_init();
   if (!bd) { reply_error("not_bluray"); return; }
+  int opened = layout == RS_FOLDER ? bd_open_files(bd, NULL, folder_dir, folder_file)
+                                   : bd_open_stream(bd, NULL, image_blocks);
+  if (!opened) { reply_error("not_bluray"); return; }
   const BLURAY_DISC_INFO *di = bd_get_disc_info(bd);
   if (!di || !di->bluray_detected) { reply_error("not_bluray"); return; }
   if (di->aacs_detected && !di->aacs_handled) { reply_error("encrypted"); return; }

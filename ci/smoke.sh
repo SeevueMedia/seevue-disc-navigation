@@ -12,9 +12,9 @@ tar xf "$dist/seevue-disc-navigation-$version-$platform.tar.xz" -C "$dir"
 tar xf "$dist"/seevue-disc-jre-*-"$platform".tar.xz -C "$dir"
 (cd "$dist" && shasum -a 256 -c "SHA256SUMS-$platform" 2>/dev/null || sha256sum -c "SHA256SUMS-$platform")
 test "$(cat "$dir/VERSION")" = "$version"
-# Each worker's first frame is its protocol v1 hello.
+# Each worker's first frame is its protocol v2 hello.
 for worker in navd bdnavd; do
-  "$dir/bin/$worker" </dev/null | grep -aq "{\"protocol\":1,\"worker\":\"$worker\",\"version\":\"$version\"}"
+  "$dir/bin/$worker" </dev/null | grep -aq "{\"protocol\":2,\"worker\":\"$worker\",\"version\":\"$version\"}"
 done
 "$dir/jre/bin/java" -Xshare:auto -version
 case "$platform" in
