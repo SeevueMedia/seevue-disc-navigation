@@ -1,0 +1,129 @@
+--- a/src/libbluray/bluray.h
++++ b/src/libbluray/bluray.h
+@@ -1172,7 +1172,20 @@
+ BD_PUBLIC int bd_user_input(BLURAY *bd, int64_t pts, uint32_t key);
+ 
+ /**
++ *
++ *  When an HDMV menu next needs a read (bd_read_ext): its graphics
++ *  controller's next timer (a page effect step, a button animation frame or
++ *  the user time-out), or the HDMV VM still running.
+  *
++ * @param bd  BLURAY object
++ * @return milliseconds until the next timer is due (0: due now),
++ *         -1 when nothing is due (only input changes the menu),
++ *         -2 when not known (not an HDMV title)
++ */
++BD_PUBLIC int64_t bd_menu_next_due_ms(BLURAY *bd);
++
++/**
++ *
+  *  Select menu button at location (x,y).
+  *
+  *  This function has no effect with BD-J menus.
+--- a/src/libbluray/bluray.c
++++ b/src/libbluray/bluray.c
+@@ -35,6 +35,7 @@
+ #include "util/logging.h"
+ #include "util/strutl.h"
+ #include "util/mutex.h"
++#include "util/time.h"
+ #include "bdnav/bdid_parse.h"
+ #include "bdnav/navigation.h"
+ #include "bdnav/index_parse.h"
+@@ -4084,7 +4085,40 @@
+ #define BD_VK_FLAGS(k)   ((k) & BD_VK_FLAGS_MASK)
+ /* HDMV: key is triggered when pressed down */
+ #define BD_KEY_TYPED(k)  (!((k) & (BD_VK_KEY_TYPED | BD_VK_KEY_RELEASED)))
++
++int64_t bd_menu_next_due_ms(BLURAY *bd)
++{
++    int64_t result = -2;
++
++    if (!bd) {
++        return -2;
++    }
++
++    bd_mutex_lock(&bd->mutex);
++
++    if (bd->title_type == title_hdmv) {
++        if (!bd->hdmv_suspended) {
++            /* the HDMV VM runs on the next read */
++            result = 0;
++        } else if (!(bd->gc_status & GC_STATUS_ANIMATE)) {
++            /* reads run the graphics controller's timers only while it animates */
++            result = -1;
++        } else {
++            int64_t due = gc_next_due(bd->graphics_controller);
++            if (due < 0) {
++                result = -1;
++            } else {
++                int64_t now = (int64_t)bd_get_scr();
++                result = due <= now ? 0 : (due - now + 89) / 90;
++            }
++        }
++    }
+ 
++    bd_mutex_unlock(&bd->mutex);
++
++    return result;
++}
++
+ int bd_user_input(BLURAY *bd, int64_t pts, uint32_t key)
+ {
+     bd_uo_mask_index_e uo_mask_idx = 0;
+--- a/src/libbluray/decoders/graphics_controller.h
++++ b/src/libbluray/decoders/graphics_controller.h
+@@ -128,6 +128,13 @@
+ 
+ 
+ /*
++ * next timer: 90 kHz clock (bd_get_scr) value when the graphics controller
++ * next needs GC_CTRL_NOP, -1 none
++ */
++
++BD_PRIVATE int64_t              gc_next_due(GRAPHICS_CONTROLLER *p);
++
++/*
+  * Add TextST font
+  */
+ 
+--- a/src/libbluray/decoders/graphics_controller.c
++++ b/src/libbluray/decoders/graphics_controller.c
+@@ -1939,6 +1939,36 @@
+     }
+ 
+     return result;
++}
++
++/* The timers _animate() and _run_timers() check, as due times. */
++int64_t gc_next_due(GRAPHICS_CONTROLLER *gc)
++{
++    int64_t due = -1;
++
++    if (!gc) {
++        return -1;
++    }
++
++    bd_mutex_lock(&gc->mutex);
++
++    if (gc->ig_open) {
++        if (gc->out_effects && gc->effect_idx < gc->out_effects->num_effects) {
++            due = gc->next_effect_time + (int64_t)gc->out_effects->effect[gc->effect_idx].duration;
++        } else if (gc->in_effects && gc->effect_idx < gc->in_effects->num_effects) {
++            due = gc->next_effect_time + (int64_t)gc->in_effects->effect[gc->effect_idx].duration;
++        } else if (gc->button_animation_running) {
++            due = gc->next_effect_time + gc->frame_interval;
++        }
++        /* _run_timers() fires once the clock is past the time-out */
++        if (gc->user_timeout && (due < 0 || gc->user_timeout + 1 < due)) {
++            due = gc->user_timeout + 1;
++        }
++    }
++
++    bd_mutex_unlock(&gc->mutex);
++
++    return due;
+ }
+ 
+ int gc_run(GRAPHICS_CONTROLLER *gc, gc_ctrl_e ctrl, uint32_t param, GC_NAV_CMDS *cmds)

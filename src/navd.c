@@ -859,7 +859,7 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
 int main(void) {
   static uint8_t payload[256];
   /* The hello, once, before any command is read. */
-  static const char hello[] = "{\"protocol\":4,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
+  static const char hello[] = "{\"protocol\":5,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
   frame('H', hello, (uint32_t)(sizeof hello - 1));
   for (;;) {
     uint8_t head[5];
