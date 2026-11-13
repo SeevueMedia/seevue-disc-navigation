@@ -977,6 +977,17 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
     snprintf(xdg, sizeof xdg, "%s/xdg", work);
     setenv("XDG_CACHE_HOME", xdg, 0);
   }
+  /* fontconfig creates a missing cache directory with mkdir and then chmod,
+     which the Linux seccomp filter refuses, so it would find no writable
+     cache and scan every font on each start. Create it here; fontconfig
+     then uses it as it is. */
+  const char *xdg_home = getenv("XDG_CACHE_HOME");
+  char fc_cache[1100];
+  if (xdg_home && *xdg_home == '/' &&
+      snprintf(fc_cache, sizeof fc_cache, "%s/fontconfig", xdg_home) < (int)sizeof fc_cache) {
+    (void)mkdir(xdg_home, 0700);
+    (void)mkdir(fc_cache, 0700);
+  }
   /* Java 18+ ignores a security manager unless the JVM allows one. libbluray
      installs its own anyway (a reflection workaround), but the JDK then skips
      its file checks, and those checks are what copy disc files into
