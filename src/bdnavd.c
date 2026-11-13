@@ -34,6 +34,11 @@
  *                 HDMV title whose movie object plays it, else a BD-J title
  *                 that starts it or lists it); "no_title" when none does
  *     'G' graphics poll: hands over BD-J plane changes (also sent before every reply)
+ *     'L' skip still: ends a timed still (an 'N' stop "still_time" whose event
+ *                 gives its seconds) once the server has shown it that long;
+ *                 the reply's "skipped" is true when the next play item
+ *                 opened, false when no timed still was holding or it was the
+ *                 title's last play item (protocol 6)
  *   BD-J runs only inside the sandbox (sandbox.h): JAVA_HOME is the Java runtime,
  *   BDNAVD_JAVA_OPTIONS the server's JVM options (heap and other caps),
  *   BDNAVD_PERSISTENT the persistent storage (none: persistent storage off);
@@ -197,7 +202,7 @@ static void send_hello(void) {
     if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) esc[k++] = *c;
   esc[k] = 0;
   int n = snprintf(hello, sizeof hello,
-                   "{\"protocol\":5,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION
+                   "{\"protocol\":6,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION
                    "\",\"sandbox\":\"%s\"%s%s%s}",
                    sandbox_state, *esc ? ",\"sandbox_error\":\"" : "", esc, *esc ? "\"" : "");
   if (n < 0 || (size_t)n >= sizeof hello) n = 0;
@@ -1224,6 +1229,19 @@ static void cmd_chapter(const uint8_t *p, uint32_t len) {
   j_end('R');
 }
 
+/* 'L': libbluray holds a timed still (BD_EVENT_STILL_TIME on every read, no
+   data) until the player ends it; the server does once it has shown the
+   still for its seconds. An infinite still (0 seconds) waits for a key. */
+static void cmd_skip_still(void) {
+  if (!bd) { reply_error("not_open"); return; }
+  int r = bd_read_skip_still(bd);
+  drain_events();
+  j_begin();
+  j("\"ok\":true,\"skipped\":%s,", r ? "true" : "false");
+  j_position();
+  j_end('R');
+}
+
 /* 'A' audio u32 stream (1-based); 'S' subtitles u32 stream (1-based), u8 enable. */
 static void cmd_stream(char c, const uint8_t *p, uint32_t len) {
   if (!bd) { reply_error("not_open"); return; }
@@ -1399,6 +1417,7 @@ int main(void) {
       case 'T': cmd_seek(payload, len); break;
       case 'V': cmd_angle(payload, len); break;
       case 'P': cmd_play(payload, len); break;
+      case 'L': cmd_skip_still(); break;
       case 'G': /* poll: BD-J graphics drawn since the last reply (sent before every reply) */
         if (!bd) { reply_error("not_open"); break; }
         bdj_watch();
