@@ -56,6 +56,14 @@
  *                 first), i64 pts (-1: none), u16 x, y, w, h, then w*h RGBA
  *                 pixels: the plane's content in that rectangle after the update
  *     'R' reply   one JSON object: {"ok":true,...} or {"ok":false,"error":"..."}
+ *   An 'N' reply that stops at "idle", "still" or "still_time" in an HDMV title
+ *   adds "next_ms": milliseconds until the menu's clock next needs a read
+ *   (a page effect step, a button animation frame, the user time-out; 0: now),
+ *   or null when nothing is due until a key. Absent elsewhere (BD-J titles).
+ *   Damage libbluray works around or only logs is one "damaged" event per kind,
+ *   "what": "playlist", "clip", "index" or "clip_info" (the clip information of
+ *   a play item that starts: unreadable, no program, no sequence, or a stream
+ *   whose coding type is not a Blu-ray one).
  */
 #define _DARWIN_C_SOURCE
 #include <errno.h>
@@ -80,6 +88,7 @@
 #include <libbluray/player_settings.h>
 #include <libbluray/filesystem.h>
 #include <libbluray/log_control.h>
+#include <libbluray/clpi_data.h>
 #include "bdcaps.h"
 #include "readsvc.h"
 #include "sandbox.h"
@@ -188,7 +197,7 @@ static void send_hello(void) {
     if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) esc[k++] = *c;
   esc[k] = 0;
   int n = snprintf(hello, sizeof hello,
-                   "{\"protocol\":4,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION
+                   "{\"protocol\":5,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION
                    "\",\"sandbox\":\"%s\"%s%s%s}",
                    sandbox_state, *esc ? ",\"sandbox_error\":\"" : "", esc, *esc ? "\"" : "");
   if (n < 0 || (size_t)n >= sizeof hello) n = 0;
@@ -451,10 +460,11 @@ static void *log_relay(void *arg) {
    clip info, a damaged index): it plays on or stays in the menu, and the viewer
    would never be told. Its log handler marks each kind once; the next reply
    carries a "damaged" event. */
-enum { DAMAGE_PLAYLIST = 1, DAMAGE_CLIP = 2, DAMAGE_INDEX = 4 };
+enum { DAMAGE_PLAYLIST = 1, DAMAGE_CLIP = 2, DAMAGE_INDEX = 4, DAMAGE_CLIP_INFO = 8 };
+#define DAMAGE_KINDS 4
 static atomic_int damage_seen, damage_reported;
 static pthread_mutex_t damage_lock = PTHREAD_MUTEX_INITIALIZER;
-static char damage_detail[3][128];
+static char damage_detail[DAMAGE_KINDS][128];
 
 static void damage_note(int kind, int slot, const char *msg) {
   pthread_mutex_lock(&damage_lock);
@@ -483,8 +493,8 @@ static void bd_log(const char *msg) {
 
 static void damage_report(void) {
   int fresh = atomic_load(&damage_seen) & ~atomic_load(&damage_reported);
-  static const char *what[3] = {"playlist", "clip", "index"};
-  for (int i = 0; i < 3; i++) {
+  static const char *what[DAMAGE_KINDS] = {"playlist", "clip", "index", "clip_info"};
+  for (int i = 0; i < DAMAGE_KINDS; i++) {
     if (!(fresh & (1 << i))) continue;
     atomic_fetch_or(&damage_reported, 1 << i);
     char detail[128];
@@ -495,6 +505,60 @@ static void damage_report(void) {
     j("\"ev\":\"damaged\",\"what\":\"%s\",\"detail\":\"%s\"", what[i], detail);
     j_end('E');
   }
+}
+
+/* The coding types a Blu-ray clip's program may carry (clpi_parse.c reads
+   these; it only logs any other and plays on). */
+static int bd_coding_type(uint8_t t) {
+  switch (t) {
+    case 0x01: case 0x02: case 0x1b: case 0x20: case 0x24: case 0xea:   /* video */
+    case 0x03: case 0x04: case 0x80: case 0x81: case 0x82: case 0x83: case 0x84:
+    case 0x85: case 0x86: case 0xa1: case 0xa2:                         /* audio */
+    case 0x90: case 0x91: case 0x92: case 0xa0:                         /* graphics, text */
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* The rule for damaged clip information, from what libbluray parsed: a clip
+   with no program or no sequence, or a program stream of no Blu-ray coding
+   type. Writes why into `why`; 0 when the clip information is sound. */
+static int clip_info_damaged(const struct clpi_cl *cl, char *why, size_t n) {
+  if (!cl->program.num_prog || !cl->program.progs) { snprintf(why, n, "no program"); return 1; }
+  if (!cl->sequence.num_atc_seq || !cl->sequence.atc_seq) { snprintf(why, n, "no sequence"); return 1; }
+  for (unsigned i = 0; i < cl->program.num_prog; i++) {
+    const CLPI_PROG *prog = &cl->program.progs[i];
+    if (!prog->num_streams || !prog->streams) { snprintf(why, n, "program %u has no streams", i); return 1; }
+    for (unsigned s = 0; s < prog->num_streams; s++)
+      if (!bd_coding_type(prog->streams[s].coding_type)) {
+        snprintf(why, n, "stream pid 0x%04x has coding type 0x%02x", prog->streams[s].pid,
+                 prog->streams[s].coding_type);
+        return 1;
+      }
+  }
+  return 0;
+}
+
+/* Checks the clip information of the play item that starts (`item` in the
+   current playlist). libbluray keeps a play item whose clip information it
+   could not parse (nor its BACKUP copy) without any: unreadable is damage too. */
+static void clip_info_check(uint32_t item) {
+  BLURAY_TITLE_INFO *ti = cur_playlist == 0xffffffff ? NULL : bd_get_playlist_info(bd, cur_playlist, 0);
+  if (!ti || item >= ti->clip_count) {
+    if (ti) bd_free_title_info(ti);
+    return;
+  }
+  char why[96], msg[128];
+  struct clpi_cl *cl = bd_get_clpi(bd, item);
+  int damaged = cl ? clip_info_damaged(cl, why, sizeof why) : (snprintf(why, sizeof why, "unreadable"), 1);
+  if (damaged) {
+    snprintf(msg, sizeof msg, "%s.clpi: %s", ti->clips[item].clip_id, why);
+    fprintf(stderr, "bdnavd: damaged clip information: %s\n", msg);
+    damage_note(DAMAGE_CLIP_INFO, 3, msg);
+  }
+  if (cl) bd_free_clpi(cl);
+  bd_free_title_info(ti);
 }
 
 static uint64_t mono_ms(void) {
@@ -726,6 +790,7 @@ static const char *event(const BD_EVENT *ev) {
   j_position();
   if (ev->event == BD_EVENT_PLAYITEM) j_streams(ev->param);
   j_end('E');
+  if (ev->event == BD_EVENT_PLAYITEM) clip_info_check(ev->param);
   if (declined) {
     decline_title(ev->param);
     /* Back to the top menu, as its key would; a disc that forbids that stops. */
@@ -1054,6 +1119,12 @@ static void cmd_next(const uint8_t *p, uint32_t len) {
   flush_batch();
   j_begin();
   j("\"ok\":true,\"stop\":\"%s\",\"bytes\":%u,", stop, delivered);
+  if (!strcmp(stop, "idle") || !strcmp(stop, "still") || !strcmp(stop, "still_time")) {
+    /* The menu clock (libbluray patch 0003): when the next read is due. */
+    int64_t due = bd_menu_next_due_ms(bd);
+    if (due >= 0) j("\"next_ms\":%" PRId64 ",", due);
+    else if (due == -1) j("\"next_ms\":null,");
+  }
   j_position();
   j_end('R');
 }
