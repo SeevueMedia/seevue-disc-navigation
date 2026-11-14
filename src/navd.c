@@ -35,6 +35,8 @@
  *      "audio":[{"logical":i,"lang":"en","format":f,"channels":c,"ext":e}, ...],
  *      "spu":[{"logical":i,"lang":"en","ext":e}, ...]}
  *   Times are in the program chain (the time 'J' seeks to); a chapter is a program.
+ *   A "nav" event in a title adds "pgc_90k" (protocol 7): its VOBU's time in the
+ *   program chain, where a seek landed.
  *   Positions (replies, "vts" and "cell" events) add "spst" (protocol 7): the logical
  *   subpicture stream SPRM 2 names, shown when "spu_on" is 1.
  *   "format" is libdvdnav's DVD_AUDIO_FORMAT_* (0 AC-3, 3 MPEG, 4 LPCM, 6 DTS,
@@ -391,6 +393,8 @@ static void event_nav(const pci_t *pci, const dsi_t *dsi, uint32_t id) {
     pci->pci_gi.vobu_se_e_ptm);
   j("\"vobu_c_idn\":%u,\"c_eltm_s\":%u,", dsi->dsi_gi.vobu_c_idn,
     (unsigned)dsi->dsi_gi.c_eltm.second);
+  /* Protocol 7: this VOBU's time in the title's program chain (a seek lands here). */
+  if (dvdnav_is_domain_vts(nav)) j("\"pgc_90k\":%" PRId64 ",", dvdnav_get_current_time(nav));
   j("\"hli_ss\":%u,\"hli_s_ptm\":%u,\"hli_e_ptm\":%u,\"btn_se_e_ptm\":%u,", g->hli_ss & 3,
     g->hli_s_ptm, g->hli_e_ptm, g->btn_se_e_ptm);
   j("\"btngr_ns\":%u,\"btngr_dsp_ty\":[%u,%u,%u],\"btn_ofn\":%u,\"btn_ns\":%u,\"nsl_btn_ns\":%u,",
