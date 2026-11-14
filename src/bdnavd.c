@@ -65,6 +65,11 @@
  *   adds "next_ms": milliseconds until the menu's clock next needs a read
  *   (a page effect step, a button animation frame, the user time-out; 0: now),
  *   or null when nothing is due until a key. Absent elsewhere (BD-J titles).
+ *   From protocol 7, a "playlist" event adds "duration_90k" and "chapters_90k"
+ *   (each chapter's start, 90 kHz playlist time, the time 'T' seeks to; at most
+ *   999), and each "playitem" audio stream adds libbluray's "format" (1 mono,
+ *   3 stereo, 6 multichannel, 12 combination) and "rate". Direct mode sends a
+ *   "playlist" event before its "playitem".
  *   Damage libbluray works around or only logs is one "damaged" event per kind,
  *   "what": "playlist", "clip", "index" or "clip_info" (the clip information of
  *   a play item that starts: unreadable, no program, no sequence, or a stream
@@ -202,7 +207,7 @@ static void send_hello(void) {
     if (*c != '"' && *c != '\\' && (unsigned char)*c >= 0x20) esc[k++] = *c;
   esc[k] = 0;
   int n = snprintf(hello, sizeof hello,
-                   "{\"protocol\":6,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION
+                   "{\"protocol\":7,\"worker\":\"bdnavd\",\"version\":\"" SEEVUE_WORKER_VERSION
                    "\",\"sandbox\":\"%s\"%s%s%s}",
                    sandbox_state, *esc ? ",\"sandbox_error\":\"" : "", esc, *esc ? "\"" : "");
   if (n < 0 || (size_t)n >= sizeof hello) n = 0;
@@ -716,12 +721,26 @@ static void j_streams(uint32_t item) {
       c->video_streams[i].coding_type, c->video_streams[i].format, c->video_streams[i].aspect);
   j("],\"audio\":[");
   for (int i = 0; i < c->audio_stream_count; i++)
-    j("%s{\"pid\":%u,\"coding\":%u,\"lang\":\"%.3s\"}", i ? "," : "", c->audio_streams[i].pid,
-      c->audio_streams[i].coding_type, (const char *)c->audio_streams[i].lang);
+    j("%s{\"pid\":%u,\"coding\":%u,\"lang\":\"%.3s\",\"format\":%u,\"rate\":%u}", i ? "," : "",
+      c->audio_streams[i].pid, c->audio_streams[i].coding_type, (const char *)c->audio_streams[i].lang,
+      c->audio_streams[i].format, c->audio_streams[i].rate);
   j("],\"pg\":[");
   for (int i = 0; i < c->pg_stream_count; i++)
     j("%s{\"pid\":%u,\"coding\":%u,\"lang\":\"%.3s\"}", i ? "," : "", c->pg_streams[i].pid,
       c->pg_streams[i].coding_type, (const char *)c->pg_streams[i].lang);
+  j("]");
+  bd_free_title_info(ti);
+}
+
+/* The playlist's length and chapter starts (90 kHz playlist time, the time
+   'T' seeks to), added to its "playlist" event (protocol 7). */
+#define MAX_CHAPTERS 999
+static void j_playlist(void) {
+  BLURAY_TITLE_INFO *ti = cur_playlist == 0xffffffff ? NULL : bd_get_playlist_info(bd, cur_playlist, 0);
+  if (!ti) return;
+  j(",\"duration_90k\":%" PRIu64 ",\"chapters_90k\":[", ti->duration);
+  for (uint32_t i = 0; i < ti->chapter_count && i < MAX_CHAPTERS; i++)
+    j("%s%" PRIu64, i ? "," : "", ti->chapters[i].start);
   j("]");
   bd_free_title_info(ti);
 }
@@ -794,6 +813,7 @@ static const char *event(const BD_EVENT *ev) {
   j("\"ev\":\"%s\",\"param\":%u,", ev_name(ev->event), ev->param);
   j_position();
   if (ev->event == BD_EVENT_PLAYITEM) j_streams(ev->param);
+  if (ev->event == BD_EVENT_PLAYLIST) j_playlist();
   j_end('E');
   if (ev->event == BD_EVENT_PLAYITEM) clip_info_check(ev->param);
   if (declined) {
@@ -1097,6 +1117,11 @@ static void cmd_next(const uint8_t *p, uint32_t len) {
        after the events selecting the title queued (they set the audio stream). */
     announced = 1;
     drain_events();
+    j_begin();
+    j("\"ev\":\"playlist\",\"param\":%u,", cur_playlist);
+    j_position();
+    j_playlist();
+    j_end('E');
     j_begin();
     j("\"ev\":\"playitem\",\"param\":0,");
     j_position();

@@ -25,9 +25,21 @@
  *     'T' play    u16 title, u16 part (0 plays the title from its start)
  *     'R' resync  u32 pci_id: move the VM to that PCI's VOBU (the picture on screen),
  *                 so a following menu call saves the displayed position for resume
- *     'L' subtitles u8 op: 0 hide, 1 the next stream the title has (after the last: hide)
+ *     'L' subtitles u8 op: 0 hide, 1 the next stream the title has (after the last: hide),
+ *                 2 show logical stream u8 n (protocol 7; "no_such_stream" when the
+ *                 program chain lacks it)
  *     'J' seek    u64 90 kHz time in the current program chain
  *     'V' angle   u8 angle (1-based; 0 the next one)
+ *   On entering a title's program chain (protocol 7), before its first "cell" event:
+ *     {"ev":"title_info","title":t,"pgc":n,"length_90k":L,"chapters_90k":[start, ...],
+ *      "audio":[{"logical":i,"lang":"en","format":f,"channels":c,"ext":e}, ...],
+ *      "spu":[{"logical":i,"lang":"en","ext":e}, ...]}
+ *   Times are in the program chain (the time 'J' seeks to); a chapter is a program.
+ *   "format" is libdvdnav's DVD_AUDIO_FORMAT_* (0 AC-3, 3 MPEG, 4 LPCM, 6 DTS,
+ *   7 SDDS, -1 unknown); "ext" the stream's code extension (audio: 1 normal,
+ *   2 visually impaired, 3 and 4 director's comments; subpictures: 1 normal,
+ *   2 large, 3 children's, 5 to 7 captions, 9 forced, 13 to 15 director's
+ *   comments); "lang" is empty when the disc names none.
  *   Commands the disc forbids here (its user-operation masks) are refused with
  *   "uop_prohibited". A read that reaches CSS-scrambled sectors (an encrypted
  *   disc) is refused with "encrypted".
@@ -416,6 +428,75 @@ static int scrambled(const uint8_t *s) {
   return p[0] == 0 && p[1] == 0 && p[2] == 1 && media && (p[6] & 0xC0) == 0x80 && (p[6] & 0x30) != 0;
 }
 
+/* ---------- title information (protocol 7) ---------- */
+
+/* The program chain last described: a new one is described once. */
+static const pgc_t *described_pgc;
+static int32_t described_title = -1;
+
+static void j_lang(uint16_t code) {
+  char a = (char)(code >> 8), b = (char)(code & 0xff);
+  if (a >= 'a' && a <= 'z' && b >= 'a' && b <= 'z') j("\"lang\":\"%c%c\"", a, b);
+  else if (a >= 'A' && a <= 'Z' && b >= 'A' && b <= 'Z') j("\"lang\":\"%c%c\"", a + 32, b + 32);
+  else j("\"lang\":\"\"");
+}
+
+/* A cell's playback time, unless it is a later angle of an angle block
+   (those play instead of the first, not after it). */
+static int64_t cell_ticks(const pgc_t *pgc, int cell) {
+  const cell_playback_t *c = &pgc->cell_playback[cell];
+  if (c->block_type == BLOCK_TYPE_ANGLE_BLOCK && c->block_mode != BLOCK_MODE_FIRST_CELL) return 0;
+  dvd_time_t t = c->playback_time;
+  return dvdnav_convert_time(&t);
+}
+
+static void event_title_info(int32_t title) {
+  const pgc_t *pgc = nav->vm->state.pgc;
+  if (!pgc || (pgc == described_pgc && title == described_title)) return;
+  described_pgc = pgc;
+  described_title = title;
+  dvd_time_t total = pgc->playback_time;
+  j_begin();
+  j("\"ev\":\"title_info\",\"title\":%d,\"pgc\":%d,\"length_90k\":%" PRId64 ",\"chapters_90k\":[", title,
+    nav->vm->state.pgcN, dvdnav_convert_time(&total));
+  /* Each program's start: the playback time of the cells before its entry cell. */
+  int64_t at = 0;
+  int cell = 0;
+  for (int p = 0; p < pgc->nr_of_programs && pgc->program_map; p++) {
+    int entry = pgc->program_map[p] - 1;
+    while (cell < entry && cell < pgc->nr_of_cells && pgc->cell_playback) at += cell_ticks(pgc, cell++);
+    j("%s%" PRId64, p ? "," : "", at);
+  }
+  j("],\"audio\":[");
+  int n = 0;
+  for (int i = 0; i < 8; i++) {
+    if (dvdnav_get_audio_logical_stream(nav, (uint8_t)i) < 0) continue;
+    audio_attr_t a;
+    memset(&a, 0, sizeof a);
+    dvdnav_get_audio_attr(nav, (uint8_t)i, &a);
+    int format = (int)dvdnav_audio_stream_format(nav, (uint8_t)i);
+    if (format == 0xffff) format = -1;
+    int channels = (int)dvdnav_audio_stream_channels(nav, (uint8_t)i);
+    if (channels == 0xffff) channels = 0;
+    j("%s{\"logical\":%d,", n++ ? "," : "", i);
+    j_lang(dvdnav_audio_stream_to_lang(nav, (uint8_t)i));
+    j(",\"format\":%d,\"channels\":%d,\"ext\":%u}", format, channels, (unsigned)a.code_extension);
+  }
+  j("],\"spu\":[");
+  n = 0;
+  for (int i = 0; i < 32; i++) {
+    if (dvdnav_get_spu_logical_stream(nav, (uint8_t)i) < 0) continue;
+    subp_attr_t s;
+    memset(&s, 0, sizeof s);
+    dvdnav_get_spu_attr(nav, (uint8_t)i, &s);
+    j("%s{\"logical\":%d,", n++ ? "," : "", i);
+    j_lang(dvdnav_spu_stream_to_lang(nav, (uint8_t)i));
+    j(",\"ext\":%u}", (unsigned)s.code_extension);
+  }
+  j("]");
+  j_end('E');
+}
+
 /* ---------- commands ---------- */
 
 static void cmd_open(const uint8_t *p, uint32_t len) {
@@ -604,6 +685,14 @@ static void cmd_next(const uint8_t *p, uint32_t len) {
       case DVDNAV_CELL_CHANGE: {
         dvdnav_cell_change_event_t *e = (dvdnav_cell_change_event_t *)block;
         flush_batch();
+        if (dvdnav_is_domain_vts(nav)) {
+          int32_t t = 0, part = 0;
+          dvdnav_current_title_info(nav, &t, &part);
+          event_title_info(t);
+        } else {
+          described_pgc = NULL;
+          described_title = -1;
+        }
         j_begin();
         j("\"ev\":\"cell\",\"cell\":%d,\"pg\":%d,\"cell_sectors\":%" PRId64 ",\"pgc_ticks\":%" PRId64
           ",\"cell_start\":%" PRId64 ",",
@@ -756,8 +845,8 @@ static int prohibited(char c, const uint8_t *p, uint32_t len) {
 }
 
 /* 'L': op 0 hides subtitles; 1 shows the next stream the program chain has,
-   or hides them after its last. */
-static dvdnav_status_t subtitles(uint8_t op) {
+   or hides them after its last; 2 shows logical stream `want_stream`. */
+static dvdnav_status_t subtitles(uint8_t op, uint8_t want_stream) {
   if (op == 0) return dvdnav_toggle_spu_stream(nav, 0);
   uint16_t sprm2 = nav->vm->state.registers.SPRM[2];
   int on = (sprm2 & 0x40) != 0, cur = sprm2 & 0x3f;
@@ -770,6 +859,15 @@ static dvdnav_status_t subtitles(uint8_t op) {
   if (first < 0) {
     snprintf(last_error, sizeof last_error, "no_subtitles");
     return DVDNAV_STATUS_ERR;
+  }
+  if (op == 2) {
+    if (want_stream > 31 || dvdnav_get_spu_logical_stream(nav, want_stream) < 0) {
+      snprintf(last_error, sizeof last_error, "no_such_stream");
+      return DVDNAV_STATUS_ERR;
+    }
+    if (dvdnav_set_active_stream(nav, want_stream, DVD_SUBTITLE_STREAM) != DVDNAV_STATUS_OK)
+      return DVDNAV_STATUS_ERR;
+    return dvdnav_toggle_spu_stream(nav, 1);
   }
   int want = on ? next : first;
   if (want < 0) return dvdnav_toggle_spu_stream(nav, 0);
@@ -819,11 +917,12 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
       st = dvdnav_set_active_stream(nav, p[0], DVD_AUDIO_STREAM);
       break;
     case 'L':
-      if (len < 1 || p[0] > 1) { reply_error("bad_subtitles"); return; }
+      if (len < 1 || p[0] > 2 || (p[0] == 2 && len < 2)) { reply_error("bad_subtitles"); return; }
       if (!dvdnav_is_domain_vts(nav)) { reply_error("not_in_title"); return; }
       last_error[0] = 0;
-      st = subtitles(p[0]);
+      st = subtitles(p[0], p[0] == 2 ? p[1] : 0);
       if (st != DVDNAV_STATUS_OK && !strcmp(last_error, "no_subtitles")) { reply_error("no_subtitles"); return; }
+      if (st != DVDNAV_STATUS_OK && !strcmp(last_error, "no_such_stream")) { reply_error("no_such_stream"); return; }
       break;
     case 'J': {
       if (len < 8) { reply_error("bad_seek"); return; }
@@ -859,7 +958,7 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
 int main(void) {
   static uint8_t payload[256];
   /* The hello, once, before any command is read. */
-  static const char hello[] = "{\"protocol\":6,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
+  static const char hello[] = "{\"protocol\":7,\"worker\":\"navd\",\"version\":\"" SEEVUE_WORKER_VERSION "\"}";
   frame('H', hello, (uint32_t)(sizeof hello - 1));
   for (;;) {
     uint8_t head[5];

@@ -19,7 +19,7 @@ Needs a C compiler, meson, ninja, pkg-config, curl and Python 3 (Linux builds ne
 
 ## Worker sandbox
 
-`bdnavd` applies its policy before its protocol 6 hello. Linux uses Landlock
+`bdnavd` applies its policy before its protocol hello. Linux uses Landlock
 and a default-deny seccomp filter; macOS checks for `sandbox-exec`. The hello
 names the sandbox or reports `unavailable`. Java stays off without one.
 
