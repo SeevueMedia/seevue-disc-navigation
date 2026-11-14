@@ -424,8 +424,9 @@ static uint64_t bdj_bytes;        /* stream read since the BD-J title started */
    whose main application failed can still draw (Ratatouille's loading
    flourish), so "drew nothing" misses it. The worker reads its own stderr
    (libbluray's and the JVM's log), passes it on, and restarts the title with
-   a menu call when an application fails to start, within BDJ_RESTARTS; a
-   failure after that is reported as final ("start"). */
+   a menu call when an application fails to start, within BDJ_START_RESTARTS
+   (BDJ_RESTARTS for a title that only draws nothing); a failure after that
+   is reported as final ("start"). */
 static atomic_int bdj_start_failed;
 /* An application that cannot even load ("doLoad() failed": its JAR is missing or
    unreadable) will not load on a restart: report it once instead. */
@@ -841,21 +842,21 @@ static const char *event(const BD_EVENT *ev) {
    time; "load" and "start" (restarts used up) once. */
 /* "reason": "start" (an application failed to start), "load" (it could not
    be loaded) or "title" (libbluray could not run the Java title). */
-static void bdj_report(const char *stage, const char *reason) {
+static void bdj_report(const char *stage, const char *reason, int attempt) {
   if (strcmp(stage, "restart")) {
     if (bdj_reported) return;
     bdj_reported = 1;
   }
   j_begin();
-  j("\"ev\":\"bdj_failed\",\"stage\":\"%s\",\"reason\":\"%s\",\"detail\":\"%s\"", stage, reason,
-    bdj_fail_line);
+  j("\"ev\":\"bdj_failed\",\"stage\":\"%s\",\"reason\":\"%s\",\"attempt\":%d,\"detail\":\"%s\"",
+    stage, reason, attempt, bdj_fail_line);
   j_end('E');
 }
 
 static void bdj_watch(void) {
   if (atomic_exchange(&bdj_load_failed, 0)) {
     fprintf(stderr, "bdnavd: BD-J application failed to load (no restart)\n");
-    bdj_report("load", "load");
+    bdj_report("load", "load", bdj_restarts + 1);
     return;
   }
   int start_failed = atomic_exchange(&bdj_start_failed, 0);
@@ -866,10 +867,15 @@ static void bdj_watch(void) {
                                                start_failed, drawn || bdj_bytes > 0, mono_ms());
   if (action == BDJ_WAIT) return;
   const char *reason = start_failed ? "start" : "no_draw";
-  if (action == BDJ_FAILED) { bdj_report("start", reason); return; }
-  fprintf(stderr, "bdnavd: BD-J start failed (%s); menu call to restart it (%d/%d)\n",
-          reason, bdj_restarts, BDJ_RESTARTS);
-  bdj_report("restart", reason);
+  if (action == BDJ_FAILED) {
+    fprintf(stderr, "bdnavd: BD-J start failed (%s) on attempt %d; no restart left\n", reason,
+            bdj_restarts + 1);
+    bdj_report("start", reason, bdj_restarts + 1);
+    return;
+  }
+  fprintf(stderr, "bdnavd: BD-J start failed (%s) on attempt %d; menu call to restart it (%d/%d)\n",
+          reason, bdj_restarts, bdj_restarts, bdj_retry_limit(start_failed));
+  bdj_report("restart", reason, bdj_restarts);
   bd_menu_call(bd, -1);
 }
 

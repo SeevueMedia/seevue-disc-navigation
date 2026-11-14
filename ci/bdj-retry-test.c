@@ -9,20 +9,30 @@ int main(void) {
   assert(bdj_retry_step(&retries, &started, 0, 0, 5001) == BDJ_RESTART);
   assert(retries == 1);
   assert(bdj_retry_step(&retries, &started, 0, 1, 5002) == BDJ_WAIT);
-  assert(!started); /* first failure, restart succeeds */
-  assert(bdj_retry_step(&retries, &started, 1, 1, 5003) == BDJ_FAILED);
-  assert(retries == 1); /* same session never acquires another retry */
+  assert(!started); /* nothing drawn, restart succeeds */
+  assert(bdj_retry_step(&retries, &started, 0, 0, 20000) == BDJ_WAIT);
+  assert(bdj_retry_step(&retries, &started, 1, 1, 5003) == BDJ_RESTART);
+  assert(retries == 2); /* a failed start may still use the second restart */
+  assert(bdj_retry_step(&retries, &started, 1, 1, 5004) == BDJ_FAILED);
+  assert(retries == 2); /* the session never acquires another */
 
   retries = 0; started = 1;
   assert(bdj_retry_step(&retries, &started, 1, 0, 2) == BDJ_RESTART);
   assert(bdj_retry_step(&retries, &started, 0, 0, 5002) == BDJ_FAILED);
-  assert(!started && retries == 1); /* explicit failure then no draw */
+  assert(!started && retries == 1); /* failed start, then no draw: one restart */
   assert(bdj_retry_step(&retries, &started, 0, 0, 10002) == BDJ_WAIT);
 
   retries = 0; started = 1;
   assert(bdj_retry_step(&retries, &started, 0, 0, 5001) == BDJ_RESTART);
   assert(bdj_retry_step(&retries, &started, 0, 0, 10001) == BDJ_FAILED);
   assert(retries == 1 && !started); /* two silent starts end with a reason */
+
+  retries = 0; started = 1;
+  assert(bdj_retry_step(&retries, &started, 1, 0, 2) == BDJ_RESTART);
+  assert(bdj_retry_step(&retries, &started, 1, 0, 3) == BDJ_RESTART);
+  assert(bdj_retry_step(&retries, &started, 1, 0, 4) == BDJ_FAILED);
+  assert(retries == 2 && !started); /* three failed starts end the session */
+  assert(bdj_retry_step(&retries, &started, 0, 0, 20000) == BDJ_WAIT);
   puts("BD-J retry policy passed");
   return 0;
 }
