@@ -35,6 +35,8 @@
  *      "audio":[{"logical":i,"lang":"en","format":f,"channels":c,"ext":e}, ...],
  *      "spu":[{"logical":i,"lang":"en","ext":e}, ...]}
  *   Times are in the program chain (the time 'J' seeks to); a chapter is a program.
+ *   Positions (replies, "vts" and "cell" events) add "spst" (protocol 7): the logical
+ *   subpicture stream SPRM 2 names, shown when "spu_on" is 1.
  *   "format" is libdvdnav's DVD_AUDIO_FORMAT_* (0 AC-3, 3 MPEG, 4 LPCM, 6 DTS,
  *   7 SDDS, -1 unknown); "ext" the stream's code extension (audio: 1 normal,
  *   2 visually impaired, 3 and 4 director's comments; subpictures: 1 normal,
@@ -352,8 +354,8 @@ static void j_position(void) {
   int32_t angle = 1, angles = 1;
   dvdnav_get_angle_info(nav, &angle, &angles);
   j("\"domain\":\"%s\",\"title\":%d,\"part\":%d,\"button\":%d,", domain(), title, part, button);
-  j("\"angle\":%d,\"angles\":%d,\"spu_on\":%d,", angle, angles,
-    (nav->vm->state.registers.SPRM[2] & 0x40) ? 1 : 0);
+  j("\"angle\":%d,\"angles\":%d,\"spu_on\":%d,\"spst\":%d,", angle, angles,
+    (nav->vm->state.registers.SPRM[2] & 0x40) ? 1 : 0, nav->vm->state.registers.SPRM[2] & 0x3f);
   j("\"audio\":%d,\"spu\":%d,\"aspect\":%u,\"scale\":%u,\"width\":%u,\"height\":%u",
     dvdnav_get_active_audio_stream(nav), dvdnav_get_active_spu_stream(nav),
     dvdnav_get_video_aspect(nav), dvdnav_get_video_scale_permission(nav), w, h);
