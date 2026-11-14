@@ -24,7 +24,8 @@
  *     'S' still_skip   'W' wait_skip   'U' go_up   'Q' state   'X' quit
  *     'T' play    u16 title, u16 part (0 plays the title from its start)
  *     'R' resync  u32 pci_id: move the VM to that PCI's VOBU (the picture on screen),
- *                 so a following menu call saves the displayed position for resume
+ *                 so a following menu call saves the displayed position for resume; it jumps
+ *                 to the VOBU's own cell (in an angle block, its angle's), by sector
  *     'L' subtitles u8 op: 0 hide, 1 the next stream the title has (after the last: hide),
  *                 2 show logical stream u8 n (protocol 7; "no_such_stream" when the
  *                 program chain lacks it)
@@ -117,6 +118,11 @@ static uint64_t image_pos;
 
 static pci_t pci_ring[PCI_RING];
 static uint32_t pci_ids[PCI_RING];
+/* Each stored PCI's VOBU: its VOB and cell ids (from the DSI) and the program chain it was read in,
+   so a resync finds the VOBU's own cell (in an angle block, cells' sector ranges overlap). */
+static uint16_t pci_vob[PCI_RING];
+static uint8_t pci_cell[PCI_RING];
+static const pgc_t *pci_pgc[PCI_RING];
 static uint32_t next_pci_id = 1;
 
 static uint8_t batch[MAX_BATCH * SECTOR];
@@ -372,11 +378,14 @@ static void j_registers(void) {
   j("]");
 }
 
-static uint32_t store_pci(const pci_t *pci) {
+static uint32_t store_pci(const pci_t *pci, const dsi_t *dsi) {
   uint32_t id = next_pci_id++;
   uint32_t slot = id % PCI_RING;
   pci_ring[slot] = *pci;
   pci_ids[slot] = id;
+  pci_vob[slot] = dsi->dsi_gi.vobu_vob_idn;
+  pci_cell[slot] = dsi->dsi_gi.vobu_c_idn;
+  pci_pgc[slot] = nav->vm->state.pgc;
   return id;
 }
 
@@ -599,7 +608,7 @@ static void cmd_next(const uint8_t *p, uint32_t len) {
         flush_batch();
         pci_t *pci = dvdnav_get_current_nav_pci(nav);
         dsi_t *dsi = dvdnav_get_current_nav_dsi(nav);
-        if (pci && dsi) event_nav(pci, dsi, store_pci(pci));
+        if (pci && dsi) event_nav(pci, dsi, store_pci(pci, dsi));
         break;
       }
       case DVDNAV_NOP:
@@ -789,24 +798,57 @@ static void cmd_resync(const uint8_t *p, uint32_t len) {
   }
   uint32_t id = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
   pci_t *want = find_pci(id);
-  pci_t *cur = dvdnav_get_current_nav_pci(nav);
-  uint32_t pos = 0, length = 0;
-  if (!want || !cur || dvdnav_get_position(nav, &pos, &length) != DVDNAV_STATUS_OK) {
+  dvd_state_t *state = &nav->vm->state;
+  uint32_t slot = id % PCI_RING;
+  /* Not in a still, and not once libdvdnav has stopped the VM (the next read starts it again). */
+  if (!want || !state->pgc || nav->position_current.still || !nav->started || nav->vm->stopped) {
     reply_error("no_position");
     return;
   }
-  /* The PGC's first sector, from where the reader is now; then the target's offset in it. */
-  int64_t pgc_start = (int64_t)cur->pci_gi.nv_pck_lbn - (int64_t)pos;
-  int64_t target = (int64_t)want->pci_gi.nv_pck_lbn - pgc_start;
-  if (target < 0 || target >= (int64_t)length) {
+  /* The VOBU's own cell in the current program chain, by its VOB and cell ids, and a jump to its
+     sector in it. libdvdnav's sector search cannot do this: its offsets count a program's cells
+     but skip an angle block's later angles, while positions count them all, so after an angle
+     block (or in a later angle) an offset lands in the wrong place. */
+  const pgc_t *pgc = state->pgc;
+  uint32_t lbn = want->pci_gi.nv_pck_lbn;
+  int cell = 0;
+  if (pci_pgc[slot] == pgc) {
+    for (int c = 1; c <= pgc->nr_of_cells && !cell; c++) {
+      const cell_position_t *at = &pgc->cell_position[c - 1];
+      const cell_playback_t *pb = &pgc->cell_playback[c - 1];
+      if (at->vob_id_nr == pci_vob[slot] && at->cell_nr == pci_cell[slot] &&
+          lbn >= pb->first_sector && lbn <= pb->last_sector)
+        cell = c;
+    }
+  }
+  if (!cell) {
     reply_error("outside_pgc");
     return;
   }
-  dvdnav_status_t st = dvdnav_sector_search(nav, target, SEEK_SET);
+  uint32_t first = pgc->cell_playback[cell - 1].first_sector;
+  /* In an angle block the VM goes back to the angle on screen too (the angle register picks the
+     block's cell, and the next angle counts from it). Entering a later angle's cell directly only
+     makes libdvdnav log that it did not enter at the block's first cell. */
+  pthread_mutex_lock(&nav->vm_lock);
+  int was_cell = state->cellN;
+  const cell_playback_t *pb = &pgc->cell_playback[cell - 1];
+  if (pb->block_type == BLOCK_TYPE_ANGLE_BLOCK) {
+    int block_first = cell;
+    while (block_first > 1 && pgc->cell_playback[block_first - 1].block_mode != BLOCK_MODE_FIRST_CELL)
+      block_first--;
+    state->AGL_REG = cell - block_first + 1;
+  }
+  vm_jump_cell_block(nav->vm, cell, lbn - first);
+  int landed = state->cellN == cell;
+  /* A plain hop, not a seek: after a seek in a multi-angle title libdvdnav skips the VOBU it
+     lands on (a sector search may land on another angle's unit); this one is the VOBU's own. */
+  if (landed) {
+    nav->cur_cell_time = 0;
+    nav->vm->hop_channel++;
+  }
+  pthread_mutex_unlock(&nav->vm_lock);
   j_begin();
-  j("\"ok\":%s,\"target\":%" PRId64 ",\"was\":%u,\"length\":%u", st == DVDNAV_STATUS_OK ? "true" : "false",
-    target, pos, length);
-  if (st != DVDNAV_STATUS_OK) j(",\"detail\":\"%s\"", dvdnav_err_to_string(nav));
+  j("\"ok\":%s,\"cell\":%d,\"was_cell\":%d,\"lbn\":%u", landed ? "true" : "false", cell, was_cell, lbn);
   j_end('R');
 }
 
