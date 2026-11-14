@@ -33,7 +33,8 @@
  *     'L' subtitles u8 op: 0 hide, 1 the next stream the title has (after the last: hide),
  *                 2 show logical stream u8 n (protocol 7; "no_such_stream" when the
  *                 program chain lacks it)
- *     'J' seek    u64 90 kHz time in the current program chain
+ *     'J' seek    u64 90 kHz time in the current program chain: the VOBU starting at or before
+ *                 it, found by the VOBUs' own times (0.8.3)
  *     'V' angle   u8 angle (1-based; 0 the next one)
  *   On entering a title's program chain (protocol 7), before its first "cell" event:
  *     {"ev":"title_info","title":t,"pgc":n,"length_90k":L,"chapters_90k":[start, ...],
@@ -72,6 +73,7 @@
 
 #include <dvdnav/dvdnav.h>
 #include <dvdread/dvd_reader.h>
+#include <dvdread/nav_read.h>
 #include <dvdread/nav_types.h>
 /* Internal headers of the pinned libdvdnav source, for register diagnostics only,
  * in the order libdvdnav's own sources include them. */
@@ -926,6 +928,80 @@ static int prohibited(char c, const uint8_t *p, uint32_t len) {
 
 /* 'L': op 0 hides subtitles; 1 shows the next stream the program chain has,
    or hides them after its last; 2 shows logical stream `want_stream`. */
+/* A VOBU's time in its cell (90 kHz): its NAV pack's cell elapsed time, read from the title's VOBs
+   (one sector). -1 when the sector does not read or is not that VOBU's NAV pack. */
+static int64_t vobu_cell_time(uint32_t sector) {
+  static uint8_t buf[SECTOR];
+  if (DVDReadBlocks(nav->file, (int)sector, 1, buf) != 1) return -1;
+  /* A NAV pack: pack header, system header, then the PCI and DSI private stream 2 packets. */
+  if (buf[0] || buf[1] || buf[2] != 1 || buf[3] != 0xba) return -1;
+  if (buf[0x400] || buf[0x401] || buf[0x402] != 1 || buf[0x403] != 0xbf || buf[0x406] != 1) return -1;
+  dsi_t dsi;
+  navRead_DSI(&dsi, buf + DSI_START_BYTE);
+  if (dsi.dsi_gi.nv_pck_lbn != sector) return -1;
+  return dvdnav_convert_time(&dsi.dsi_gi.c_eltm);
+}
+
+/* 'J': a seek to t (90 kHz, in the program chain). libdvdnav's dvdnav_time_search finds the cell,
+   then guesses the sector by interpolating over the cell's bytes, which on a variable-bitrate film
+   lands seconds away (seevue#1555: 7 s early). navd finds the cell the same way, then the VOBU
+   itself: the cell's VOBUs from the title's address map, bisected by each VOBU's own time (one
+   NAV pack read each, about a dozen per seek), landing on the last VOBU that starts at or before
+   t. An angle block, a cell the map does not cover in order, or a NAV pack that does not read
+   falls back to libdvdnav's search. */
+static dvdnav_status_t seek_time(uint64_t t) {
+  dvd_state_t *state = &nav->vm->state;
+  const pgc_t *pgc = state->pgc;
+  if (!pgc || nav->position_current.still || !nav->file || !nav->vm->vtsi ||
+      !nav->vm->vtsi->vts_vobu_admap || state->domain != DVD_DOMAIN_VTSTitle)
+    return dvdnav_time_search(nav, t);
+  int first = 1, last = pgc->nr_of_cells;
+  if (!nav->pgc_based) {
+    first = pgc->program_map[state->pgN - 1];
+    if (state->pgN < pgc->nr_of_programs) last = pgc->program_map[state->pgN] - 1;
+  }
+  uint64_t left = t;
+  int cell = 0;
+  for (int c = first; c <= last && !cell; c++) {
+    const cell_playback_t *pb = &pgc->cell_playback[c - 1];
+    if (pb->block_type == BLOCK_TYPE_ANGLE_BLOCK && pb->block_mode != BLOCK_MODE_FIRST_CELL) continue;
+    uint64_t length = (uint64_t)dvdnav_convert_time(&pb->playback_time);
+    if (left >= length) left -= length;
+    else cell = c;
+  }
+  if (!cell) return dvdnav_time_search(nav, t);
+  const cell_playback_t *pb = &pgc->cell_playback[cell - 1];
+  if (pb->block_type == BLOCK_TYPE_ANGLE_BLOCK) return dvdnav_time_search(nav, t);
+  /* The cell's VOBUs: a run of the address map from its first sector, in increasing order. */
+  const vobu_admap_t *map = nav->vm->vtsi->vts_vobu_admap;
+  uint32_t entries = (map->last_byte + 1 - VOBU_ADMAP_SIZE) / VOBU_ADMAP_SIZE;
+  uint32_t lo = 0;
+  while (lo < entries && map->vobu_start_sectors[lo] != pb->first_sector) lo++;
+  if (lo == entries) return dvdnav_time_search(nav, t);
+  uint32_t hi = lo + 1;
+  while (hi < entries && map->vobu_start_sectors[hi] <= pb->last_sector) {
+    if (map->vobu_start_sectors[hi] <= map->vobu_start_sectors[hi - 1]) return dvdnav_time_search(nav, t);
+    hi++;
+  }
+  /* The last VOBU in [lo, hi) starting at or before `left`; the cell's first starts at 0. */
+  uint32_t a = lo, b = hi;
+  while (b - a > 1) {
+    uint32_t m = a + (b - a) / 2;
+    int64_t at = vobu_cell_time(map->vobu_start_sectors[m]);
+    if (at < 0) return dvdnav_time_search(nav, t);
+    if ((uint64_t)at <= left) a = m;
+    else b = m;
+  }
+  pthread_mutex_lock(&nav->vm_lock);
+  int ok = vm_jump_cell_block(nav->vm, cell, (int)(map->vobu_start_sectors[a] - pb->first_sector));
+  if (ok) {
+    nav->cur_cell_time = 0;
+    nav->vm->hop_channel += HOP_SEEK;
+  }
+  pthread_mutex_unlock(&nav->vm_lock);
+  return ok ? DVDNAV_STATUS_OK : dvdnav_time_search(nav, t);
+}
+
 static dvdnav_status_t subtitles(uint8_t op, uint8_t want_stream) {
   if (op == 0) return dvdnav_toggle_spu_stream(nav, 0);
   uint16_t sprm2 = nav->vm->state.registers.SPRM[2];
@@ -1016,7 +1092,7 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
       uint64_t t = 0;
       for (int i = 7; i >= 0; i--) t = (t << 8) | p[i];
       if (!dvdnav_is_domain_vts(nav)) { reply_error("not_in_title"); return; }
-      st = dvdnav_time_search(nav, t);
+      st = seek_time(t);
       break;
     }
     case 'V': {
