@@ -25,7 +25,11 @@
  *     'T' play    u16 title, u16 part (0 plays the title from its start)
  *     'R' resync  u32 pci_id: move the VM to that PCI's VOBU (the picture on screen),
  *                 so a following menu call saves the displayed position for resume; it jumps
- *                 to the VOBU's own cell (in an angle block, its angle's), by sector
+ *                 to the VOBU's own cell (in an angle block, its angle's), by sector. The jump
+ *                 waits for the next read or the next command the disc allows there (masks
+ *                 at that VOBU); a refused command, a button, play or seek drops it
+ *   After a stop (a title that ends with nowhere to go) the next read, play or menu call
+ *   starts the disc again at First Play with the player's settings kept.
  *     'L' subtitles u8 op: 0 hide, 1 the next stream the title has (after the last: hide),
  *                 2 show logical stream u8 n (protocol 7; "no_such_stream" when the
  *                 program chain lacks it)
@@ -514,6 +518,42 @@ static void event_title_info(int32_t title) {
 
 /* ---------- commands ---------- */
 
+/* A resync's jump, until the next read or allowed command (see cmd_resync). */
+static struct {
+  int active;
+  int cell;
+  uint32_t block;
+  pci_t pci;
+  const pgc_t *pgc;
+} pending;
+
+static void drop_pending(void) { pending.active = 0; }
+
+/* Moves the VM to the pending VOBU: its cell (in an angle block, the angle register follows it, so
+   the next angle counts from the picture on screen; entering a later angle's cell directly only makes
+   libdvdnav log that it did not enter at the block's first cell) and its sector. A plain hop, not a
+   seek: after a seek in a multi-angle title libdvdnav skips the VOBU it lands on. */
+static void apply_pending(void) {
+  if (!pending.active) return;
+  pending.active = 0;
+  dvd_state_t *state = &nav->vm->state;
+  if (state->pgc != pending.pgc || nav->vm->stopped) return;
+  const pgc_t *pgc = state->pgc;
+  pthread_mutex_lock(&nav->vm_lock);
+  if (pgc->cell_playback[pending.cell - 1].block_type == BLOCK_TYPE_ANGLE_BLOCK) {
+    int block_first = pending.cell;
+    while (block_first > 1 && pgc->cell_playback[block_first - 1].block_mode != BLOCK_MODE_FIRST_CELL)
+      block_first--;
+    state->AGL_REG = pending.cell - block_first + 1;
+  }
+  vm_jump_cell_block(nav->vm, pending.cell, (int)pending.block);
+  if (state->cellN == pending.cell) {
+    nav->cur_cell_time = 0;
+    nav->vm->hop_channel++;
+  }
+  pthread_mutex_unlock(&nav->vm_lock);
+}
+
 static void cmd_open(const uint8_t *p, uint32_t len) {
   if (nav) {
     reply_error("already_open");
@@ -562,6 +602,9 @@ static void cmd_open(const uint8_t *p, uint32_t len) {
   dvdnav_get_number_of_titles(nav, &titles);
   const char *volid = NULL;
   dvdnav_get_title_string(nav, &volid);
+  /* What libdvdnav logged while opening is not damage (an image read through the read service
+     always logs "dvd_read_name failed"): a later stop's detail names only what came after. */
+  last_error[0] = 0;
   j_begin();
   j("\"ok\":true,\"titles\":%d,\"image_bytes\":%" PRIu64 ",\"disc_regions\":%d,\"volume\":\"", titles,
     image_size, disc_regions & 0xff);
@@ -576,6 +619,7 @@ static void cmd_next(const uint8_t *p, uint32_t len) {
     reply_error(nav ? "bad_next" : "not_open");
     return;
   }
+  apply_pending();
   uint32_t max = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
   if (max == 0 || max > MAX_BATCH) max = MAX_BATCH;
   uint8_t block[SECTOR];
@@ -763,6 +807,7 @@ static void cmd_button(const uint8_t *p, uint32_t len) {
     reply_error(nav ? "bad_button" : "not_open");
     return;
   }
+  drop_pending(); /* a button acts on its own VOBU's highlight */
   uint8_t op = p[0], button = p[1];
   uint32_t id = p[2] | (p[3] << 8) | (p[4] << 16) | ((uint32_t)p[5] << 24);
   pci_t *pci = find_pci(id);
@@ -796,6 +841,7 @@ static void cmd_resync(const uint8_t *p, uint32_t len) {
     reply_error(nav ? "bad_resync" : "not_open");
     return;
   }
+  drop_pending();
   uint32_t id = p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
   pci_t *want = find_pci(id);
   dvd_state_t *state = &nav->vm->state;
@@ -825,40 +871,26 @@ static void cmd_resync(const uint8_t *p, uint32_t len) {
     reply_error("outside_pgc");
     return;
   }
-  uint32_t first = pgc->cell_playback[cell - 1].first_sector;
-  /* In an angle block the VM goes back to the angle on screen too (the angle register picks the
-     block's cell, and the next angle counts from it). Entering a later angle's cell directly only
-     makes libdvdnav log that it did not enter at the block's first cell. */
-  pthread_mutex_lock(&nav->vm_lock);
-  int was_cell = state->cellN;
-  const cell_playback_t *pb = &pgc->cell_playback[cell - 1];
-  if (pb->block_type == BLOCK_TYPE_ANGLE_BLOCK) {
-    int block_first = cell;
-    while (block_first > 1 && pgc->cell_playback[block_first - 1].block_mode != BLOCK_MODE_FIRST_CELL)
-      block_first--;
-    state->AGL_REG = cell - block_first + 1;
-  }
-  vm_jump_cell_block(nav->vm, cell, lbn - first);
-  int landed = state->cellN == cell;
-  /* A plain hop, not a seek: after a seek in a multi-angle title libdvdnav skips the VOBU it
-     lands on (a sector search may land on another angle's unit); this one is the VOBU's own. */
-  if (landed) {
-    nav->cur_cell_time = 0;
-    nav->vm->hop_channel++;
-  }
-  pthread_mutex_unlock(&nav->vm_lock);
+  /* The jump waits for what follows: the next read, or the next command the disc allows at the
+     picture on screen (its masks are that VOBU's, not the reader's). A command the disc forbids
+     drops it, so a refused key leaves the reader where it was and nothing restarts. */
+  pending.active = 1;
+  pending.cell = cell;
+  pending.block = lbn - pgc->cell_playback[cell - 1].first_sector;
+  pending.pci = *want;
+  pending.pgc = pgc;
   j_begin();
-  j("\"ok\":%s,\"cell\":%d,\"was_cell\":%d,\"lbn\":%u", landed ? "true" : "false", cell, was_cell, lbn);
+  j("\"ok\":true,\"cell\":%d,\"was_cell\":%d,\"lbn\":%u", cell, state->cellN, lbn);
   j_end('R');
 }
 
 /* The user operations the disc forbids now: the program chain's and the
-   current VOBU's masks together. */
+   current VOBU's masks together (after a resync, the picture on screen's). */
 static user_ops_t uops(void) {
   user_ops_t u;
   memset(&u, 0, sizeof u);
   if (nav->vm->state.pgc) u = nav->vm->state.pgc->prohibited_ops;
-  pci_t *pci = dvdnav_get_current_nav_pci(nav);
+  pci_t *pci = pending.active ? &pending.pci : dvdnav_get_current_nav_pci(nav);
   if (pci) {
     const uint8_t *a = (const uint8_t *)&pci->pci_gi.vobu_uop_ctl;
     uint8_t *b = (uint8_t *)&u;
@@ -930,26 +962,30 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
     return;
   }
   if (prohibited(c, p, len)) {
+    drop_pending();
     reply_error("uop_prohibited");
     return;
   }
   dvdnav_status_t st = DVDNAV_STATUS_OK;
   switch (c) {
-    case 'S': st = dvdnav_still_skip(nav); break;
-    case 'W': st = dvdnav_wait_skip(nav); break;
-    case 'U': st = dvdnav_go_up(nav); break;
+    case 'S': apply_pending(); st = dvdnav_still_skip(nav); break;
+    case 'W': apply_pending(); st = dvdnav_wait_skip(nav); break;
+    case 'U': apply_pending(); st = dvdnav_go_up(nav); break;
     case 'M':
-      if (len < 1) { reply_error("bad_menu"); return; }
+      if (len < 1) { drop_pending(); reply_error("bad_menu"); return; }
+      apply_pending();
       st = dvdnav_menu_call(nav, (DVDMenuID_t)p[0]);
       break;
     case 'T': {
+      drop_pending();
       if (len < 4) { reply_error("bad_play"); return; }
       int32_t title = p[0] | (p[1] << 8), part = p[2] | (p[3] << 8);
       st = part ? dvdnav_part_play(nav, title, part) : dvdnav_title_play(nav, title);
       break;
     }
     case 'P': /* chapter: 0 previous, 1 top of this one, 2 next */
-      if (len < 1) { reply_error("bad_chapter"); return; }
+      if (len < 1) { drop_pending(); reply_error("bad_chapter"); return; }
+      apply_pending();
     {
       /* Previous in the first chapter restarts it, as players do; libdvdnav's
          previous-program search does nothing there, and no jump follows. */
@@ -961,18 +997,21 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
       break;
     }
     case 'A': /* logical audio stream, as the remote's audio button selects it */
-      if (len < 1) { reply_error("bad_audio"); return; }
+      if (len < 1) { drop_pending(); reply_error("bad_audio"); return; }
+      apply_pending();
       st = dvdnav_set_active_stream(nav, p[0], DVD_AUDIO_STREAM);
       break;
     case 'L':
-      if (len < 1 || p[0] > 2 || (p[0] == 2 && len < 2)) { reply_error("bad_subtitles"); return; }
-      if (!dvdnav_is_domain_vts(nav)) { reply_error("not_in_title"); return; }
+      if (len < 1 || p[0] > 2 || (p[0] == 2 && len < 2)) { drop_pending(); reply_error("bad_subtitles"); return; }
+      if (!dvdnav_is_domain_vts(nav)) { drop_pending(); reply_error("not_in_title"); return; }
+      apply_pending();
       last_error[0] = 0;
       st = subtitles(p[0], p[0] == 2 ? p[1] : 0);
       if (st != DVDNAV_STATUS_OK && !strcmp(last_error, "no_subtitles")) { reply_error("no_subtitles"); return; }
       if (st != DVDNAV_STATUS_OK && !strcmp(last_error, "no_such_stream")) { reply_error("no_such_stream"); return; }
       break;
     case 'J': {
+      drop_pending(); /* a seek goes somewhere else */
       if (len < 8) { reply_error("bad_seek"); return; }
       uint64_t t = 0;
       for (int i = 7; i >= 0; i--) t = (t << 8) | p[i];
@@ -981,15 +1020,17 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
       break;
     }
     case 'V': {
-      if (len < 1) { reply_error("bad_angle"); return; }
+      if (len < 1) { drop_pending(); reply_error("bad_angle"); return; }
       int32_t cur = 1, num = 1;
       dvdnav_get_angle_info(nav, &cur, &num);
-      if (num <= 1) { reply_error("no_angles"); return; }
+      if (num <= 1) { drop_pending(); reply_error("no_angles"); return; }
+      apply_pending();
+      dvdnav_get_angle_info(nav, &cur, &num);
       st = dvdnav_angle_change(nav, p[0] ? p[0] : (cur % num) + 1);
       break;
     }
     case 'Q': break;
-    default: reply_error("bad_command"); return;
+    default: drop_pending(); reply_error("bad_command"); return;
   }
   j_begin();
   j("\"ok\":%s,", st == DVDNAV_STATUS_OK ? "true" : "false");
@@ -997,6 +1038,33 @@ static void cmd_simple(char c, const uint8_t *p, uint32_t len) {
   j_position();
   j_registers();
   j_end('R');
+}
+
+/* A stopped VM (the title ended with nowhere to go) is restarted by libdvdnav's next read, title
+   play or menu call with vm_reset(NULL, NULL, NULL), which forgets the stream callbacks the image is
+   read through (libdvdread then reads through NULL ones and navd crashes) and the player's settings
+   (languages, region, parental level, display). navd restarts it as a player does: the disc's own
+   state cleared, the player's kept, and libdvdnav finds the VM not stopped, so it plays First Play
+   on the open disc. */
+static void before_restart(void) {
+  if (!nav || nav->started || !nav->vm->stopped) return;
+  dvd_state_t *s = &nav->vm->state;
+  memset(s->registers.GPRM, 0, sizeof s->registers.GPRM);
+  memset(s->registers.GPRM_mode, 0, sizeof s->registers.GPRM_mode);
+  memset(s->registers.GPRM_time, 0, sizeof s->registers.GPRM_time);
+  s->AST_REG = 15;
+  s->SPST_REG = 62;
+  s->AGL_REG = 1;
+  s->TTN_REG = 1;
+  s->VTS_TTN_REG = 1;
+  s->PTTN_REG = 1;
+  s->HL_BTNN_REG = 1 << 10;
+  s->rsm_vtsN = 0;
+  s->rsm_cellN = 0;
+  s->rsm_blockN = 0;
+  nav->vm->stopped = 0;
+  last_error[0] = 0;
+  drop_pending();
 }
 
 #ifndef SEEVUE_WORKER_VERSION
@@ -1019,6 +1087,7 @@ int main(void) {
     uint32_t len = total - 1;
     if (len > 0 && read_all(payload, len) < 0) break;
     char c = (char)head[4];
+    if (c != 'O' && c != 'Q' && c != 'X' && c != 'R') before_restart();
     switch (c) {
       case 'O': cmd_open(payload, len); break;
       case 'N': cmd_next(payload, len); break;
