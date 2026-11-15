@@ -280,6 +280,14 @@ mkdir -p "$WORK/jre-stage"
 "$JDK_HOME/bin/jlink" --add-modules "$MODULES" --strip-debug --no-man-pages --no-header-files \
   --compress=zip-6 --output "$JRE"
 JRE_BYTES="$(du -sk "$JRE" | awk '{print $1 * 1024}')"
+# A BD-J image loaded from a file stays complete after its fetch ends
+# (patches/libbluray/0004), checked with the shipped AWT jar and runtime.
+AWT_JAR="$(ls "$STAGE/lib/"libbluray-awt-j2se-*.jar)"
+rm -rf "$WORK/bdimage-test"
+"$JDK_HOME/bin/javac" -nowarn --patch-module "java.desktop=$AWT_JAR:$ROOT/ci/java" \
+  -d "$WORK/bdimage-test" "$ROOT/ci/java/java/awt/BDImageConsumerTest.java"
+"$JRE/bin/java" -Djava.awt.headless=true --patch-module "java.desktop=$AWT_JAR:$WORK/bdimage-test" \
+  java.awt.BDImageConsumerTest
 
 cc_version="$(cc --version | head -1)"
 python3 - "$STAGE/BUILDINFO.json" <<EOF

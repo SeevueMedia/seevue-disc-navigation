@@ -14,8 +14,10 @@ bdnavd Blu-ray navigation. Dynamically linked with libbluray 1.5.0 and
        in lib/ so they can be replaced. bdnavd itself is distributed under
        the GPL, version 2 or later.
 
-libbluray carries two patches (licenses/patches/libbluray/): serialised
-libudfread calls and the IG animation frame interval. libdvdnav carries two
+libbluray carries four patches (licenses/patches/libbluray/): serialised
+libudfread calls, the IG animation frame interval, the menu's next due time,
+and a BD-J image that has finished loading no longer consuming its producer
+(BDImageConsumer). libdvdnav carries two
 (licenses/patches/libdvdnav/): dvdnav_open_files, which opens a disc folder
 through libdvdread's file-system callbacks, and SPRM 14 kept as the player
 set it. libdvdread carries one
