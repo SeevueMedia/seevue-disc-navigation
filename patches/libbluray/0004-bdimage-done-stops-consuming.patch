@@ -1,0 +1,24 @@
+BD-J: a BDImageConsumer whose image is done stops consuming its producer,
+as the JDK's ImageRepresentation does. Otherwise the JDK's image fetcher
+still counts it as interested when the fetch ends and reports IMAGEERROR
+after STATICIMAGEDONE; a MediaTracker check after that sees the image as
+failed, and a disc's Java menu that checks its images this way fails to
+start intermittently.
+
+--- a/src/libbluray/bdj/java/java/awt/BDImageConsumer.java	2026-07-17 10:55:51
++++ b/src/libbluray/bdj/java/java/awt/BDImageConsumer.java	2026-11-15 14:21:48
+@@ -95,6 +95,14 @@
+     }
+ 
+     public void imageComplete(int stat) {
++        /* A finished image (anything but SINGLEFRAMEDONE) stops consuming, as
++         * the JDK's ImageRepresentation does. Otherwise the producer still
++         * counts this consumer as interested when its fetch ends and reports
++         * IMAGEERROR after STATICIMAGEDONE, and a MediaTracker that checks
++         * the image after that sees it as failed. */
++        if (stat != SINGLEFRAMEDONE && producer != null) {
++            producer.removeConsumer(this);
++        }
+         switch (stat) {
+         case IMAGEERROR:
+             status |= ImageObserver.ERROR;
